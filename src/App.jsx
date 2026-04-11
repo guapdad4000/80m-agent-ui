@@ -53,6 +53,8 @@ import useHermesApi from './hooks/useHermesApi';
 import useOffline from './hooks/useOffline';
 import ShareHandler from './ShareHandler';
 import { getQueue, processQueue, queueMessage } from './offlineQueue';
+import { buildApiPayload, extractAssistantText } from './lib/chatTransport';
+import { getHermesBase, getLocalApiBase, getWebhookBase, getEndpointConfig, setEndpointConfig } from './config/endpoints';
 
 // =====================================================================
 // USE AUDIO HOOK — Web Audio API for subtle UI sounds
@@ -210,11 +212,12 @@ const WaveformIndicator = ({ agentState, isRecording, agentThinking }) => {
 // =====================================================================
 // DEFAULT AGENT CONFIG — user-configurable via Settings
 // =====================================================================
-const HERMES_BASE = 'http://localhost:5174';
-const LOCAL_API_BASE = 'http://localhost:5175';
+const HERMES_BASE = getHermesBase();
+const LOCAL_API_BASE = getLocalApiBase();
+const WEBHOOK_BASE = getWebhookBase();
 const HERMES_HTTP = HERMES_BASE;
 const DEFAULT_CONFIG = {
-  apiEndpoint: 'http://localhost:5174/chat',
+  apiEndpoint: `${HERMES_BASE}/chat`,
   apiEnabled: true,
   agents: [
     { id: 'prawnius', icon: 'Bot', role: 'Quick Tasks', color: '#22c55e' },
@@ -261,6 +264,82 @@ const formatRelativeTime = (timestamp) => {
   return new Date(timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 };
 
+const tryStreamJobViaSSE = async ({ baseUrl, jobId, timeoutMs = 15000 }) => {
+  if (typeof window === 'undefined' || typeof EventSource === 'undefined') return null;
+
+  const candidates = [
+    `${baseUrl}/chat/stream/${encodeURIComponent(jobId)}`,
+    `${baseUrl}/chat/stream?job_id=${encodeURIComponent(jobId)}`,
+  ];
+
+  for (const url of candidates) {
+    const result = await new Promise((resolve) => {
+      let settled = false;
+      let hasTraffic = false;
+      let responseText = '';
+      const toolEvents = [];
+      let es;
+      let timer;
+
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try { es?.close(); } catch (_) {}
+        resolve(value);
+      };
+
+      es = new EventSource(url);
+      timer = setTimeout(() => finish(null), timeoutMs);
+
+      es.onmessage = (event) => {
+        hasTraffic = true;
+        const data = event?.data;
+        if (!data) return;
+        if (data === '[DONE]') {
+          finish({ completed: true, responseText: responseText.trim(), events: toolEvents });
+          return;
+        }
+
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.status === 'failed') {
+            finish({ failed: true, error: parsed.error || parsed.result?.error || 'Hermes job failed' });
+            return;
+          }
+          if (Array.isArray(parsed.events)) {
+            toolEvents.push(...parsed.events.filter(e => e?.type === 'tool'));
+          }
+          if (parsed.type === 'tool') toolEvents.push(parsed);
+
+          const delta = parsed.delta || parsed.token || parsed.text || '';
+          if (delta) responseText += delta;
+          if (parsed.response) responseText = parsed.response;
+
+          if (parsed.status === 'completed') {
+            finish({ completed: true, responseText: (parsed.response || responseText || '').trim(), events: toolEvents });
+          }
+        } catch {
+          responseText += String(data);
+        }
+      };
+
+      es.onerror = () => {
+        if (hasTraffic) {
+          finish({ completed: false, partial: true, responseText: responseText.trim(), events: toolEvents });
+        } else {
+          finish(null);
+        }
+      };
+    });
+
+    if (result?.failed) throw new Error(result.error || 'Hermes stream failed');
+    if (result?.completed) return result;
+  }
+
+  return null;
+};
+
 // =====================================================================
 // PERSISTENCE HELPERS
 // =====================================================================
@@ -297,6 +376,9 @@ const SettingsPanel = ({ config, onSave, onClose }) => {
   const [activeTab, setActiveTab] = useState('connection');
   const [saveStatus, setSaveStatus] = useState('');
   const [testResult, setTestResult] = useState(null);
+  const [endpointConfig, setLocalEndpointConfig] = useState(getEndpointConfig);
+  const [endpointStatus, setEndpointStatus] = useState('');
+  const [endpointChecks, setEndpointChecks] = useState([]);
 
   const handleSave = () => {
     onSave(localConfig);
@@ -353,6 +435,31 @@ const SettingsPanel = ({ config, onSave, onClose }) => {
     } catch (err) {
       setTestResult({ ok: false, message: err.message || 'Connection failed' });
     }
+  };
+
+  const handleSaveEndpoints = () => {
+    setEndpointConfig(endpointConfig);
+    setEndpointStatus('saved');
+    setTimeout(() => setEndpointStatus(''), 2500);
+  };
+
+  const handleTestAllEndpoints = async () => {
+    const checks = [
+      { name: 'Hermes /sessions', url: `${endpointConfig.hermesBase}/sessions` },
+      { name: 'Local API /fs/list', url: `${endpointConfig.localApiBase}/fs/list?path=/` },
+      { name: 'Webhook /webhooks', url: `${endpointConfig.webhookBase}/webhooks` },
+    ];
+    const results = [];
+    for (const check of checks) {
+      const started = performance.now();
+      try {
+        const res = await fetch(check.url, { signal: AbortSignal.timeout(5000) });
+        results.push({ ...check, ok: res.ok, status: res.status, ms: Math.round(performance.now() - started) });
+      } catch (err) {
+        results.push({ ...check, ok: false, status: 'ERR', ms: Math.round(performance.now() - started), error: err.message });
+      }
+    }
+    setEndpointChecks(results);
   };
 
   const BEHAVIOR_PRESETS = [
@@ -495,7 +602,7 @@ const SettingsPanel = ({ config, onSave, onClose }) => {
                   type="text"
                   value={localConfig.apiEndpoint}
                   onChange={e => setLocalConfig(p => ({ ...p, apiEndpoint: e.target.value }))}
-                  placeholder="http://localhost:5174/chat"
+                  placeholder={`${HERMES_BASE}/chat`}
                   className="flex-1 bg-white border-[3px] border-[#111] px-3 py-2 font-mono text-xs focus:outline-none focus:shadow-[4px_4px_0_0_#111]"
                 />
                 <button
@@ -516,6 +623,55 @@ const SettingsPanel = ({ config, onSave, onClose }) => {
               <p className="font-mono text-[8px] text-[#666]">
                 Leave empty or disable to use demo mode (simulated responses)
               </p>
+            </div>
+
+            <div className="p-3 border-[3px] border-[#111] bg-[#f5f5f0] space-y-2">
+              <div className="flex items-center justify-between">
+                <p className="font-mono text-[9px] font-black uppercase tracking-[0.12em] text-[#111]">Service Endpoints</p>
+                {endpointStatus === 'saved' && <span className="font-mono text-[8px] font-black text-[#22c55e]">SAVED</span>}
+              </div>
+              <input
+                value={endpointConfig.hermesBase}
+                onChange={e => setLocalEndpointConfig(prev => ({ ...prev, hermesBase: e.target.value }))}
+                placeholder="Hermes base URL"
+                className="w-full bg-white border-[2px] border-[#111] px-2 py-1.5 font-mono text-[9px] focus:outline-none focus:border-[#22c55e]"
+              />
+              <input
+                value={endpointConfig.localApiBase}
+                onChange={e => setLocalEndpointConfig(prev => ({ ...prev, localApiBase: e.target.value }))}
+                placeholder="Local API base URL"
+                className="w-full bg-white border-[2px] border-[#111] px-2 py-1.5 font-mono text-[9px] focus:outline-none focus:border-[#22c55e]"
+              />
+              <input
+                value={endpointConfig.webhookBase}
+                onChange={e => setLocalEndpointConfig(prev => ({ ...prev, webhookBase: e.target.value }))}
+                placeholder="Webhook base URL"
+                className="w-full bg-white border-[2px] border-[#111] px-2 py-1.5 font-mono text-[9px] focus:outline-none focus:border-[#22c55e]"
+              />
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleSaveEndpoints}
+                  className="px-3 py-1.5 border-[2px] border-[#111] bg-[#111] text-[#22c55e] font-mono text-[9px] font-black uppercase hover:bg-[#222]"
+                >
+                  Save Endpoints
+                </button>
+                <button
+                  onClick={handleTestAllEndpoints}
+                  className="px-3 py-1.5 border-[2px] border-[#111] bg-white text-[#111] font-mono text-[9px] font-black uppercase hover:bg-[#eee]"
+                >
+                  Test All
+                </button>
+              </div>
+              {endpointChecks.length > 0 && (
+                <div className="space-y-1 pt-1">
+                  {endpointChecks.map((check, idx) => (
+                    <p key={idx} className={`font-mono text-[8px] ${check.ok ? 'text-[#166534]' : 'text-[#991b1b]'}`}>
+                      {check.ok ? '✅' : '❌'} {check.name} — {check.status} ({check.ms}ms){check.error ? ` — ${check.error}` : ''}
+                    </p>
+                  ))}
+                </div>
+              )}
+              <p className="font-mono text-[7px] text-[#777]">Reload app after saving so all modules use new endpoint values.</p>
             </div>
 
             <div className="flex items-center justify-between p-3 border-[3px] border-[#111] bg-white">
@@ -865,7 +1021,7 @@ const MemoryBrowserPanel = ({ onClose }) => {
     setLoading(true);
     setError('');
     try {
-      const res = await fetch('http://localhost:5174/chat', {
+      const res = await fetch(`${HERMES_BASE}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -895,7 +1051,7 @@ const MemoryBrowserPanel = ({ onClose }) => {
     setError('');
     setActiveTab('recent');
     try {
-      const res = await fetch('http://localhost:5174/chat', {
+      const res = await fetch(`${HERMES_BASE}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1029,7 +1185,7 @@ const JobsPipelinePanel = ({ onClose }) => {
     setError('');
     try {
       // Try Hermes jobs endpoint
-      let res = await fetch('http://localhost:5174/jobs', { signal: AbortSignal.timeout(5000) });
+      let res = await fetch(`${HERMES_BASE}/jobs`, { signal: AbortSignal.timeout(5000) });
       if (!res.ok) {
         // Fallback: try /fs/list for a jobs directory
         res = await fetch(`${HERMES_BASE}/fs/list?path=/home/falcon/.hermes/jobs`, { signal: AbortSignal.timeout(5000) });
@@ -1207,7 +1363,7 @@ const MCPSettingsPanel = ({ onClose }) => {
   const testConnection = async (serverName) => {
     setTestResults(prev => ({ ...prev, [serverName]: 'testing' }));
     try {
-      const res = await fetch('http://localhost:5174/mcp/test', {
+      const res = await fetch(`${HERMES_BASE}/mcp/test`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ server: serverName }),
@@ -2457,6 +2613,93 @@ const HeaderStatusFrame = ({ state }) => {
   );
 };
 
+const ONBOARDING_STEPS = [
+  { title: 'Welcome to 80M', desc: 'This quick wizard will connect Hermes and tune your workspace.', mascotState: 'jump' },
+  { title: 'Configure Endpoints', desc: 'Open Settings → Connection and save Hermes, Local API, and Webhook bases.', mascotState: 'processing' },
+  { title: 'Run Health Check', desc: 'Use “Run System Diagnostics” to verify Hermes sessions, fs, and webhooks.', mascotState: 'searching' },
+  { title: 'Execute First Prompt', desc: 'Pick an agent and send a test task. You are now mission-ready.', mascotState: 'job-done' },
+];
+
+const OnboardingWizard = ({ step, onNext, onBack, onFinish }) => {
+  const current = ONBOARDING_STEPS[step] || ONBOARDING_STEPS[0];
+  const isLast = step === ONBOARDING_STEPS.length - 1;
+
+  return (
+    <div className="fixed inset-0 z-[250] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
+      <div className="w-full max-w-4xl border-[4px] border-[#111] bg-[#eae7de] shadow-[10px_10px_0_0_#111] grid lg:grid-cols-[1fr_1.2fr] gap-4 p-4">
+        <div className="h-64 lg:h-[420px] border-[3px] border-[#111] bg-white p-2">
+          <AtmMascot state={current.mascotState} />
+        </div>
+        <div className="flex flex-col justify-between p-2 space-y-4">
+          <div className="space-y-3">
+            <p className="font-mono text-[10px] font-black uppercase tracking-[0.2em] text-[#22c55e]">
+              Setup_Wizard {step + 1}/{ONBOARDING_STEPS.length}
+            </p>
+            <h2 className="font-serif text-3xl font-black text-[#111] tracking-tight">{current.title}</h2>
+            <p className="font-mono text-sm text-[#333] leading-relaxed">{current.desc}</p>
+          </div>
+          <div className="flex items-center justify-between">
+            <button
+              onClick={onBack}
+              disabled={step === 0}
+              className="px-4 py-2 border-[3px] border-[#111] bg-white font-mono text-[10px] font-black uppercase disabled:opacity-40"
+            >
+              Back
+            </button>
+            {isLast ? (
+              <button onClick={onFinish} className="px-5 py-2 border-[3px] border-[#111] bg-[#22c55e] font-mono text-[10px] font-black uppercase">
+                Finish Setup
+              </button>
+            ) : (
+              <button onClick={onNext} className="px-5 py-2 border-[3px] border-[#111] bg-[#111] text-[#22c55e] font-mono text-[10px] font-black uppercase">
+                Next
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const MessageMarkdown = ({ content, role = 'assistant' }) => {
+  const isUser = role === 'user';
+  const baseText = isUser ? 'text-[#111]' : 'text-[#e8e8ec]';
+
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        h1: ({ ...props }) => <h1 className={`font-serif text-xl lg:text-2xl font-black tracking-tight mt-2 mb-3 ${baseText}`} {...props} />,
+        h2: ({ ...props }) => <h2 className={`font-serif text-lg lg:text-xl font-black tracking-tight mt-4 mb-2 ${baseText}`} {...props} />,
+        h3: ({ ...props }) => <h3 className={`font-mono text-sm lg:text-base font-black uppercase tracking-[0.08em] mt-4 mb-2 ${baseText}`} {...props} />,
+        p: ({ ...props }) => <p className={`font-mono text-sm lg:text-base leading-relaxed mb-3 last:mb-0 ${baseText}`} {...props} />,
+        ul: ({ ...props }) => <ul className={`list-disc pl-6 space-y-1 mb-3 ${baseText}`} {...props} />,
+        ol: ({ ...props }) => <ol className={`list-decimal pl-6 space-y-1 mb-3 ${baseText}`} {...props} />,
+        li: ({ ...props }) => <li className="font-mono text-sm lg:text-base leading-relaxed" {...props} />,
+        blockquote: ({ ...props }) => (
+          <blockquote className={`border-l-4 ${isUser ? 'border-[#111]/50 bg-[#111]/5' : 'border-[#22c55e]/50 bg-[#111]/35'} px-3 py-2 my-3 italic`} {...props} />
+        ),
+        code: ({ inline, className, children, ...props }) => (
+          inline ? (
+            <code className={`${isUser ? 'bg-[#111]/10' : 'bg-[#111]/70'} px-1.5 py-0.5 rounded font-mono text-xs`} {...props}>
+              {children}
+            </code>
+          ) : (
+            <code className={`${className || ''}`} {...props}>{children}</code>
+          )
+        ),
+        pre: ({ ...props }) => (
+          <pre className={`${isUser ? 'bg-[#111]/10 text-[#111]' : 'bg-[#111]/70 text-[#e8e8ec]'} border border-[#3a3a3e] rounded-xl p-3 overflow-x-auto mb-3 font-mono text-xs`} {...props} />
+        ),
+        hr: ({ ...props }) => <hr className={`my-4 ${isUser ? 'border-[#111]/20' : 'border-[#e8e8ec]/20'}`} {...props} />,
+      }}
+    >
+      {content || ''}
+    </ReactMarkdown>
+  );
+};
+
 // =====================================================================
 // MAIN APP — Original UI preserved exactly, new features added around it
 // =====================================================================
@@ -2481,11 +2724,14 @@ export default function App() {
   const [previewFilePath, setPreviewFilePath] = useState('');
   const [showPathInput, setShowPathInput] = useState(false);
   const [pathInputValue, setPathInputValue] = useState('');
+  const [showOnboarding, setShowOnboarding] = useState(() => !localStorage.getItem('80m-onboarding-complete'));
+  const [onboardingStep, setOnboardingStep] = useState(0);
+  const [messageCount, setMessageCount] = useState(0);
 
   // --- Offline support ---
   const [queuedCount, setQueuedCount] = useState(() => getQueue().length);
   const { isOnline, isHermesConnected, queueCount } = useOffline();
-  const { flushQueue } = useHermesApi();
+  const { flushQueue, checkConnection, fetchFsList } = useHermesApi();
 
   // --- Projects ---
   const [projects, setProjects] = useState(() => {
@@ -2553,9 +2799,20 @@ export default function App() {
   const [isRecording, setIsRecording] = useState(false);
   const recordingRef = useRef(false);
   const recognitionRef = useRef(null);
+  const mascotTimerRef = useRef(null);
 
   // --- New: Audio feedback (Web Audio API) ---
   const { unlock, playSendClick, playAgentChime } = useAudio();
+
+  const pulseMascot = useCallback((state, holdMs = 1200) => {
+    setAgentState(state);
+    if (mascotTimerRef.current) clearTimeout(mascotTimerRef.current);
+    mascotTimerRef.current = setTimeout(() => setAgentState('default'), holdMs);
+  }, []);
+
+  useEffect(() => () => {
+    if (mascotTimerRef.current) clearTimeout(mascotTimerRef.current);
+  }, []);
 
   // Unlock audio on first user interaction
   useEffect(() => {
@@ -2754,17 +3011,73 @@ export default function App() {
     setShowPWAInstall(false);
   };
 
+  const finishOnboarding = () => {
+    localStorage.setItem('80m-onboarding-complete', '1');
+    setShowOnboarding(false);
+    pulseMascot('job-done', 1600);
+  };
+
   // --- Command palette actions ---
+  const runSystemDiagnostics = async () => {
+    const check = async (name, fn) => {
+      const started = performance.now();
+      try {
+        await fn();
+        return { name, ok: true, ms: Math.round(performance.now() - started) };
+      } catch (error) {
+        return { name, ok: false, ms: Math.round(performance.now() - started), error: error.message };
+      }
+    };
+
+    setAgentState('processing');
+    const checks = await Promise.all([
+      check('Hermes /sessions', async () => {
+        const ok = await checkConnection();
+        if (!ok) throw new Error('Hermes unreachable');
+      }),
+      check('Hermes /fs/list', async () => {
+        const fs = await fetchFsList('/');
+        if (!fs) throw new Error('No response');
+      }),
+      check('Webhook Service /webhooks', async () => {
+        const res = await fetch(`${WEBHOOK_BASE}/webhooks`, { signal: AbortSignal.timeout(5000) });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      }),
+    ]);
+
+    const queue = getQueue();
+    const passed = checks.filter(c => c.ok).length;
+    const summary = [
+      '## System Diagnostics',
+      '',
+      `**Checks passed:** ${passed}/${checks.length}`,
+      `**Queue depth:** ${queue.length}`,
+      '',
+      ...checks.map(c => `- ${c.ok ? '✅' : '❌'} **${c.name}** (${c.ms}ms)${c.ok ? '' : ` — ${c.error}`}`),
+      '',
+      queue.length > 0 ? `- ⚠️ ${queue.filter(i => i.status === 'dead-letter').length} dead-letter messages need manual review.` : '- ✅ Queue is empty.',
+    ].join('\n');
+
+    setMessages(prev => [...prev, {
+      id: Date.now() + 2,
+      role: 'assistant',
+      employee: activeEmployee,
+      content: summary,
+    }]);
+    pulseMascot(passed === checks.length ? 'job-done' : 'urgent', 1500);
+  };
+
   const commandActions = [
     { label: 'New Conversation', icon: <MessageSquare size={14} />, action: () => { createConversation(); setShowCommandPalette(false); } },
     { label: 'Open Knowledge Vault', icon: <Database size={14} />, action: () => { setShowVault(true); setShowCommandPalette(false); } },
     { label: 'Open Skills Module', icon: <Zap size={14} />, action: () => { setShowSkills(true); setShowCommandPalette(false); } },
     { label: 'Open Session Memory', icon: <Brain size={14} />, action: () => { setShowMemory(true); setShowCommandPalette(false); } },
     { label: 'Open Webhooks', icon: <Globe size={14} />, action: () => { setShowWebhook(true); setShowCommandPalette(false); } },
+    { label: 'Run System Diagnostics', icon: <Activity size={14} />, action: () => { runSystemDiagnostics(); setShowCommandPalette(false); } },
     { label: 'Settings', icon: <Settings size={14} />, action: () => { setShowSettings(true); setShowCommandPalette(false); } },
     { label: 'Clear Messages', icon: <Trash2 size={14} />, action: () => { setMessages([]); setShowCommandPalette(false); } },
     ...config.agents.map(agent => ({
-      label: `Switch to ${agent.name}`, icon: <Bot size={14} />, action: () => { setActiveEmployee(agent.id); setShowCommandPalette(false); }
+      label: `Switch to ${agent.id}`, icon: <Bot size={14} />, action: () => { setActiveEmployee(agent.id); setShowCommandPalette(false); }
     })),
   ];
   const filteredCommands = commandActions.filter(c => c.label.toLowerCase().includes(cmdSearch.toLowerCase()));
@@ -2782,7 +3095,6 @@ export default function App() {
     e.preventDefault();
     if (!inputValue.trim()) return;
 
-    const userMsg = { id: Date.now(), role: 'user', content: inputValue };
     const contextPrefix = contextVars.length > 0
       ? `[${projectNamespace || 'global'}] `
       : '';
@@ -2790,6 +3102,8 @@ export default function App() {
     setMessages(prev => [...prev, { id: Date.now(), role: 'user', content: displayMsg }]);
     setInputValue('');
     playSendClick();
+    pulseMascot('jump', 500);
+    if (inputValue.toLowerCase().includes('lobster')) pulseMascot('lobster', 1800);
 
     // If API is enabled, make a real request
     if (config.apiEnabled && config.apiEndpoint) {
@@ -2804,6 +3118,7 @@ export default function App() {
           content: `[Message queued — will send when Hermes reconnects. Queue: ${queueCount + 1}]`,
         }]);
         setQueuedCount(q => q + 1);
+        pulseMascot('sleep', 1600);
         return;
       }
 
@@ -2824,48 +3139,63 @@ export default function App() {
         const submitRes = await fetch(config.apiEndpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: fullMessage, agent_id: activeEmployee }),
+          body: JSON.stringify(buildApiPayload({ endpoint: config.apiEndpoint, message: fullMessage, agentId: activeEmployee })),
           signal: AbortSignal.timeout(30000),
         });
 
         if (!submitRes.ok) throw new Error(`HTTP ${submitRes.status}`);
         const submitData = await submitRes.json();
         const jobId = submitData.job_id;
-        if (!jobId) throw new Error('Missing job_id from Hermes backend');
-
-        let completed = false;
-        for (let i = 0; i < 300; i++) {
-          await new Promise(r => setTimeout(r, 1000));
-          const statusRes = await fetch(`${HERMES_BASE}/chat/status/${jobId}`, {
-            signal: AbortSignal.timeout(10000),
-          });
-          if (!statusRes.ok) continue;
-          const statusData = await statusRes.json();
-
-          if (statusData.status === 'queued' || statusData.status === 'running') {
-            setAgentState('typing');
-            continue;
-          }
-
-          if (statusData.status === 'completed') {
-            // Hermes returns { response: "...", events: [...] }
-            const responseText = statusData.response || statusData.result?.response || '';
-            const events = statusData.events || statusData.result?.events || [];
-            setToolEventsByMsg(prev => ({ ...prev, [assistantMsgId]: events.filter(e => e.type === 'tool') }));
-            setMessages(prev => prev.map(m => m.id === assistantMsgId ? { ...m, content: responseText || '[No response returned]' } : m));
+        if (jobId) {
+          let completed = false;
+          pulseMascot('searching', 1200);
+          const streamed = await tryStreamJobViaSSE({ baseUrl: HERMES_BASE, jobId });
+          if (streamed?.completed) {
+            setToolEventsByMsg(prev => ({ ...prev, [assistantMsgId]: streamed.events || [] }));
+            setMessages(prev => prev.map(m => m.id === assistantMsgId ? { ...m, content: streamed.responseText || '[No response returned]' } : m));
             completed = true;
-            break;
           }
 
-          if (statusData.status === 'failed') {
-            throw new Error(statusData.result?.error || statusData.error || 'Hermes job failed');
+          // SSE unavailable or unsupported by backend: fallback to status polling.
+          if (!completed) {
+            for (let i = 0; i < 300; i++) {
+              await new Promise(r => setTimeout(r, 1000));
+              const statusRes = await fetch(`${HERMES_BASE}/chat/status/${jobId}`, {
+                signal: AbortSignal.timeout(10000),
+              });
+              if (!statusRes.ok) continue;
+              const statusData = await statusRes.json();
+
+              if (statusData.status === 'queued' || statusData.status === 'running') {
+                setAgentState('typing');
+                continue;
+              }
+
+              if (statusData.status === 'completed') {
+                // Hermes returns { response: "...", events: [...] }
+                const responseText = statusData.response || statusData.result?.response || '';
+                const events = statusData.events || statusData.result?.events || [];
+                setToolEventsByMsg(prev => ({ ...prev, [assistantMsgId]: events.filter(e => e.type === 'tool') }));
+                setMessages(prev => prev.map(m => m.id === assistantMsgId ? { ...m, content: responseText || '[No response returned]' } : m));
+                completed = true;
+                break;
+              }
+
+              if (statusData.status === 'failed') {
+                throw new Error(statusData.result?.error || statusData.error || 'Hermes job failed');
+              }
+            }
           }
+          if (!completed) throw new Error('Hermes job timeout');
+        } else {
+          const responseText = extractAssistantText(submitData);
+          if (!responseText) throw new Error('No response payload from endpoint');
+          setMessages(prev => prev.map(m => m.id === assistantMsgId ? { ...m, content: responseText } : m));
         }
 
-        if (!completed) throw new Error('Hermes job timeout');
-
-        setAgentState('job-done');
-        setTimeout(() => setAgentState('default'), 1500);
+        const nextCount = messageCount + 1;
+        setMessageCount(nextCount);
+        pulseMascot(nextCount % 5 === 0 ? 'jackpot' : 'job-done', 1500);
       } catch (err) {
         // On error, queue the message for retry instead of showing error
         const queuedId = queueMessage({ text: displayMsg, agent: activeEmployee });
@@ -2874,7 +3204,7 @@ export default function App() {
           content: `[Connection lost — message queued. Will retry when Hermes reconnects.]`,
         } : m));
         setQueuedCount(q => q + 1);
-        setAgentState('default');
+        pulseMascot('error', 1800);
       } finally {
         setAgentThinking(false);
       }
@@ -2893,7 +3223,7 @@ export default function App() {
           setToolEventsByMsg(prev => ({ ...prev, [demoMsgId]: [...(prev[demoMsgId] || []), codeEvent] }));
           setMessages(prev => [...prev, { id: demoMsgId, role: 'assistant', employee: activeEmployee, content: `Protocol initiated by ${activeEmployee}. Analyzing parameters for "${inputValue}". local server hooks validated.` }]);
       }, 2000);
-      setTimeout(() => setAgentState('job-done'), 4000);
+      setTimeout(() => setAgentState(inputValue.toLowerCase().includes('lobster') ? 'lobster' : 'job-done'), 4000);
       setTimeout(() => setAgentState('default'), 5500);
     }
   };
@@ -3365,7 +3695,9 @@ export default function App() {
                         </div>
                       )}
                       {msg.content ? (
-                        <p className="font-mono text-base lg:text-lg leading-relaxed whitespace-pre-wrap tracking-tight">{msg.content}</p>
+                        <div className={`prose prose-invert max-w-none ${msg.role === 'user' ? 'prose-neutral' : ''}`}>
+                          <MessageMarkdown content={String(msg.content)} role={msg.role} />
+                        </div>
                       ) : agentThinking && index === filteredArr.length - 1 ? (
                         <div className="flex items-center gap-2 text-[#888] py-2"><Activity size={14} className="animate-pulse" /> <span className="font-mono text-[10px] uppercase tracking-widest">Processing...</span></div>
                       ) : null}
@@ -3538,6 +3870,17 @@ export default function App() {
             <div className="fixed inset-0 z-[160] flex items-center justify-center bg-black/30 backdrop-blur-sm p-4">
               <WebhookPanel onClose={() => setShowWebhook(false)} />
             </div>
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {showOnboarding && (
+            <OnboardingWizard
+              step={onboardingStep}
+              onBack={() => setOnboardingStep(s => Math.max(0, s - 1))}
+              onNext={() => setOnboardingStep(s => Math.min(ONBOARDING_STEPS.length - 1, s + 1))}
+              onFinish={finishOnboarding}
+            />
           )}
         </AnimatePresence>
 

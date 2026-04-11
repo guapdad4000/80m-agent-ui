@@ -1,8 +1,9 @@
 // useOffline.js — Tracks online/offline status and Hermes connectivity
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { getQueue } from '../offlineQueue';
+import { getHermesBase } from '../config/endpoints';
 
-const HERMES_BASE = 'http://localhost:5174';
+const HERMES_BASE = getHermesBase();
 const PING_INTERVAL_MS = 10000; // ping Hermes every 10s
 
 export default function useOffline() {
