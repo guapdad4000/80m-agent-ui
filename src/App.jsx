@@ -4123,13 +4123,30 @@ export default function App() {
                     type="button"
                     onClick={toggleRecording}
                     aria-label={isRecording ? 'Stop voice recording' : 'Start voice recording'}
-                    className={`grid place-items-center w-10 h-10 rounded-xl border-[1px] transition-all ${isRecording ? 'bg-[#ef4444]/15 text-[#ef4444] border-[#ef4444]/40 animate-pulse' : 'bg-[#22c55e]/10 text-[#22c55e] border-[#22c55e]/30 hover:bg-[#22c55e]/20 hover:border-[#22c55e]/50 active:scale-95'}`}
+                    className={`group grid place-items-center w-10 h-10 rounded-xl border-[1px] transition-all duration-300 ${isRecording ? 'bg-[#ef4444]/15 text-[#ef4444] border-[#ef4444]/40 animate-[mic-pulse_1s_ease-in-out_infinite]' : 'bg-[#22c55e]/10 text-[#22c55e] border-[#22c55e]/30 hover:bg-[#22c55e]/20 hover:border-[#22c55e]/50 active:scale-95'}`}
                   >
-                    <svg viewBox="0 0 24 24" fill="none" className="w-4 h-4" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <rect x="9" y="2" width="6" height="12" rx="3" />
-                      <path d="M5 10a7 7 0 0 0 14 0" />
-                      <path d="M12 17v5" />
-                      <path d="M8 22h8" />
+                    {/* Animated mic SVG with sound wave bars on hover */}
+                    <svg
+                      viewBox="0 0 36 36"
+                      fill="none"
+                      xmlns="http://www.w3.org/2000/svg"
+                      className={`w-5 h-5 transition-all duration-300 ${isRecording ? 'animate-[sound-wave_0.6s_ease-in-out_infinite]' : 'group-hover:animate-[sound-wave_0.8s_ease-in-out_infinite]'}`}
+                    >
+                      {/* Mic body */}
+                      <rect x="13" y="4" width="10" height="14" rx="5" fill="currentColor" opacity="0.9" />
+                      {/* Mic stand arc */}
+                      <path d="M9 14a9 9 0 0 0 18 0" stroke="currentColor" strokeWidth="2" strokeLinecap="round" fill="none" />
+                      {/* Stand stem */}
+                      <path d="M18 23v5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+                      {/* Base */}
+                      <path d="M13 31h10" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+                      {/* Left sound wave bars — visible on hover or recording */}
+                      <rect x="3" y="10" width="2.5" height="6" rx="1.25" fill="currentColor" opacity="0" className={`${isRecording ? 'opacity-100' : 'group-hover:opacity-100'}`} />
+                      <rect x="3" y="10" width="2.5" height="6" rx="1.25" fill="currentColor" opacity="0" className={`${isRecording ? 'opacity-100 animate-[bar-scale_0.6s_ease-in-out_infinite_0ms]' : 'group-hover:animate-[bar-scale_0.8s_ease-in-out_infinite_0ms]'}`} />
+                      <rect x="7" y="8" width="2.5" height="10" rx="1.25" fill="currentColor" opacity="0" className={`${isRecording ? 'opacity-100 animate-[bar-scale_0.6s_ease-in-out_infinite_100ms]' : 'group-hover:animate-[bar-scale_0.8s_ease-in-out_infinite_100ms]'}`} />
+                      {/* Right sound wave bars */}
+                      <rect x="30.5" y="10" width="2.5" height="6" rx="1.25" fill="currentColor" opacity="0" className={`${isRecording ? 'opacity-100 animate-[bar-scale_0.6s_ease-in-out_infinite_0ms]' : 'group-hover:animate-[bar-scale_0.8s_ease-in-out_infinite_0ms]'}`} />
+                      <rect x="26.5" y="8" width="2.5" height="10" rx="1.25" fill="currentColor" opacity="0" className={`${isRecording ? 'opacity-100 animate-[bar-scale_0.6s_ease-in-out_infinite_100ms]' : 'group-hover:animate-[bar-scale_0.8s_ease-in-out_infinite_100ms]'}`} />
                     </svg>
                   </button>
                   <button
