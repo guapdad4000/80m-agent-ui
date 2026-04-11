@@ -1,15 +1,17 @@
 import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Zap, Trash2, Plus, X, ExternalLink, CheckCircle2, XCircle, Globe, Clock } from 'lucide-react';
+import { getHermesBase, getWebhookBase } from './config/endpoints';
 
-const WEBHOOK_API = 'http://localhost:5176';
+const WEBHOOK_API = getWebhookBase();
+const HERMES_BASE = getHermesBase();
 
 export default function WebhookPanel({ onClose }) {
   const [webhooks, setWebhooks] = useState([]);
   const [logs, setLogs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
-  const [form, setForm] = useState({ name: '', url: '', agent: 'Hermes', endpoint: 'http://localhost:5174/chat', secret: '' });
+  const [form, setForm] = useState({ name: '', url: '', agent: 'Hermes', endpoint: `${HERMES_BASE}/chat`, secret: '' });
 
   const fetchWebhooks = () => {
     setLoading(true);
@@ -29,7 +31,7 @@ export default function WebhookPanel({ onClose }) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(form),
     });
-    setForm({ name: '', url: '', agent: 'Hermes', endpoint: 'http://localhost:5174/chat', secret: '' });
+    setForm({ name: '', url: '', agent: 'Hermes', endpoint: `${HERMES_BASE}/chat`, secret: '' });
     setShowAdd(false);
     fetchWebhooks();
   };
@@ -159,9 +161,9 @@ export default function WebhookPanel({ onClose }) {
         <p className="font-mono text-[7px] text-[#888] uppercase mb-1">Receive-Webhook-Endpoint</p>
         <div className="flex items-center gap-2">
           <code className="flex-1 font-mono text-[8px] bg-[#f5f5f0] border-[2px] border-[#ddd] px-2 py-1 text-[#111] truncate">
-            http://localhost:5176/webhooks/trigger
+            {WEBHOOK_API}/webhooks/trigger
           </code>
-          <button onClick={() => navigator.clipboard.writeText('http://localhost:5176/webhooks/trigger')} className="px-2 py-1 bg-[#111] text-[#eae7de] border-[2px] border-[#111] font-mono text-[7px] hover:bg-[#22c55e] hover:text-[#111] transition-colors">COPY</button>
+          <button onClick={() => navigator.clipboard.writeText(`${WEBHOOK_API}/webhooks/trigger`)} className="px-2 py-1 bg-[#111] text-[#eae7de] border-[2px] border-[#111] font-mono text-[7px] hover:bg-[#22c55e] hover:text-[#111] transition-colors">COPY</button>
         </div>
         <p className="font-mono text-[7px] text-[#aaa] mt-1">Set this as your external webhook URL. Send POST with <code className="bg-[#eee] px-1">X-Webhook-Secret</code> header to validate.</p>
       </div>

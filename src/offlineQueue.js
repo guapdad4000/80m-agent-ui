@@ -2,6 +2,8 @@
 // Uses localStorage to persist queued messages when Hermes is unreachable
 
 const QUEUE_KEY = '80m-offline-queue';
+const MAX_RETRIES = 5;
+const BASE_BACKOFF_MS = 5000;
 
 const generateId = () => `msg_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 
@@ -17,7 +19,8 @@ export const queueMessage = (msg) => {
     text: msg.text,
     agent: msg.agent || 'prawnius',
     timestamp: Date.now(),
-    status: 'queued', // 'queued' | 'sending' | 'sent' | 'failed'
+    attempts: 0,
+    status: 'queued', // 'queued' | 'sending' | 'sent' | 'failed' | 'dead-letter'
   };
   queue.push(item);
   localStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
@@ -63,8 +66,19 @@ export const clearQueue = () => {
 export const processQueue = async (sendFn) => {
   const queue = getQueue();
   const results = [];
+  const now = Date.now();
 
   for (const item of queue) {
+    if (item.nextRetryAt && item.nextRetryAt > now) {
+      results.push({ id: item.id, success: false, skipped: true, reason: 'backoff' });
+      continue;
+    }
+    if ((item.attempts || 0) >= MAX_RETRIES) {
+      updateQueueItem(item.id, { status: 'dead-letter', deadLetteredAt: Date.now() });
+      results.push({ id: item.id, success: false, skipped: true, reason: 'max-retries' });
+      continue;
+    }
+
     // Mark as sending
     updateQueueItem(item.id, { status: 'sending' });
     try {
@@ -74,7 +88,14 @@ export const processQueue = async (sendFn) => {
       results.push({ id: item.id, success: true, result });
     } catch (err) {
       // Failed — leave in queue with failed status
-      updateQueueItem(item.id, { status: 'failed', error: err.message });
+      const attempts = (item.attempts || 0) + 1;
+      const nextRetryAt = Date.now() + Math.min(BASE_BACKOFF_MS * (2 ** (attempts - 1)), 5 * 60 * 1000);
+      updateQueueItem(item.id, {
+        status: attempts >= MAX_RETRIES ? 'dead-letter' : 'failed',
+        attempts,
+        nextRetryAt,
+        error: err.message,
+      });
       results.push({ id: item.id, success: false, error: err.message });
     }
   }

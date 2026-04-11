@@ -1,8 +1,10 @@
 // useHermesApi.js — Offline-aware wrapper for all Hermes API calls
 import { useState, useCallback, useRef } from 'react';
 import { queueMessage, processQueue } from '../offlineQueue';
+import { isOpenAICompatibleEndpoint, buildApiPayload, extractAssistantText } from '../lib/chatTransport';
+import { getHermesBase } from '../config/endpoints';
 
-const HERMES_BASE = 'http://localhost:5174';
+const HERMES_BASE = getHermesBase();
 const HERMES_URL = HERMES_BASE;
 const POLL_INTERVAL_MS = 2000;
 
@@ -66,10 +68,13 @@ export default function useHermesApi() {
     }
 
     // Submit the job
-    const res = await fetch(`${HERMES_URL}/chat`, {
+    const endpoint = isOpenAICompatibleEndpoint(HERMES_URL) ? HERMES_URL : `${HERMES_URL}/chat`;
+    const payload = buildApiPayload({ endpoint, message: text, agentId });
+
+    const res = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text, agent_id: agentId }),
+      body: JSON.stringify(payload),
       signal: AbortSignal.timeout(30000),
     });
 
@@ -77,14 +82,18 @@ export default function useHermesApi() {
     const data = await res.json();
     const jobId = data.job_id;
 
-    if (!jobId) throw new Error('Missing job_id from Hermes');
+    if (jobId) {
+      // Poll until done
+      const statusData = await pollJobStatus(jobId);
+      // Hermes agent-chat-service returns: { response: "...", events: [...] }
+      const responseText = statusData.response || statusData.result?.response || '';
+      const events = statusData.events || statusData.result?.events || [];
+      return { queued: false, jobId, response: responseText, events };
+    }
 
-    // Poll until done
-    const statusData = await pollJobStatus(jobId);
-    // Hermes agent-chat-service returns: { response: "...", events: [...] }
-    const responseText = statusData.response || statusData.result?.response || '';
-    const events = statusData.events || statusData.result?.events || [];
-    return { queued: false, jobId, response: responseText, events };
+    const responseText = extractAssistantText(data);
+    if (!responseText) throw new Error('Missing response payload from endpoint');
+    return { queued: false, response: responseText, events: [] };
   }, [checkConnection, pollJobStatus]);
 
   /**
