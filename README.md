@@ -106,6 +106,49 @@ The PWA manifest and service worker are generated automatically.
 
 ---
 
+## Mobile Access from Anywhere with Tailscale
+
+If your goal is: “install this PWA on phone/iPad and connect from anywhere,” this repo already includes a helper script: `deploy-tailscale.sh`.
+
+### Option A (recommended): private access over your Tailnet
+
+Best when only you/team should access the UI.
+
+1. On the host machine, install and log into Tailscale.
+2. Build + serve the app:
+
+```bash
+./deploy-tailscale.sh --serve-only
+```
+
+3. On your iPhone/iPad, install the **Tailscale** app and sign into the same tailnet.
+4. In Tailscale admin, note your host MagicDNS name (something like `hostname.tailnet.ts.net`).
+5. Open on mobile:
+
+```text
+http://<your-magicdns-name>:5190
+```
+
+6. In Safari, use **Share → Add to Home Screen** to install as an app.
+
+### Option B: public URL using Tailscale Funnel
+
+Use this when you truly need internet-reachable access without joining your tailnet.
+
+```bash
+./deploy-tailscale.sh --funnel
+```
+
+The script enables Funnel on port `5190` and prints the HTTPS URL. Open that URL on mobile and install to home screen.
+
+### Practical notes
+
+- Keep your API endpoint in app Settings pointed at a URL reachable from mobile (tailnet URL, Funnel URL, or public backend).
+- If your backend is private, expose backend and UI consistently (both on tailnet, or both public with auth).
+- Funnel is public internet exposure; add auth/rate limits at your backend before sharing widely.
+
+---
+
 ## Custom Branding
 
 To rebrand for a different agent/business:

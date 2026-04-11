@@ -379,6 +379,10 @@ const SettingsPanel = ({ config, onSave, onClose }) => {
   const [endpointConfig, setLocalEndpointConfig] = useState(getEndpointConfig);
   const [endpointStatus, setEndpointStatus] = useState('');
   const [endpointChecks, setEndpointChecks] = useState([]);
+  const [tailnetHost, setTailnetHost] = useState('');
+  const [tailscalePort, setTailscalePort] = useState('5190');
+  const [tailscaleScheme, setTailscaleScheme] = useState('http');
+  const [tailscaleHint, setTailscaleHint] = useState('');
 
   const handleSave = () => {
     onSave(localConfig);
@@ -441,6 +445,32 @@ const SettingsPanel = ({ config, onSave, onClose }) => {
     setEndpointConfig(endpointConfig);
     setEndpointStatus('saved');
     setTimeout(() => setEndpointStatus(''), 2500);
+  };
+
+  const applyTailscaleEndpoint = () => {
+    const host = tailnetHost.trim().replace(/^https?:\/\//, '').replace(/\/+$/, '');
+    if (!host) {
+      setTailscaleHint('Enter your Tailnet hostname first (example: macbook.tailnet.ts.net)');
+      return;
+    }
+    const endpoint = `${tailscaleScheme}://${host}:${tailscalePort}/chat`;
+    setLocalConfig(prev => ({ ...prev, apiEndpoint: endpoint }));
+    setTailscaleHint(`Applied API endpoint: ${endpoint}`);
+  };
+
+  const copyMobileUrl = async () => {
+    const host = tailnetHost.trim().replace(/^https?:\/\//, '').replace(/\/+$/, '');
+    if (!host) {
+      setTailscaleHint('Enter your Tailnet hostname to copy mobile URL');
+      return;
+    }
+    const mobileUrl = `${tailscaleScheme}://${host}:${tailscalePort}`;
+    try {
+      await navigator.clipboard.writeText(mobileUrl);
+      setTailscaleHint(`Copied mobile URL: ${mobileUrl}`);
+    } catch {
+      setTailscaleHint(`Copy failed. Use this URL manually: ${mobileUrl}`);
+    }
   };
 
   const handleTestAllEndpoints = async () => {
@@ -623,6 +653,52 @@ const SettingsPanel = ({ config, onSave, onClose }) => {
               <p className="font-mono text-[8px] text-[#666]">
                 Leave empty or disable to use demo mode (simulated responses)
               </p>
+            </div>
+
+            <div className="p-3 border-[3px] border-[#111] bg-[#f5f5f0] space-y-2">
+              <div className="flex items-center gap-2">
+                <Globe size={12} />
+                <p className="font-mono text-[9px] font-black uppercase tracking-[0.12em] text-[#111]">Tailscale Mobile Helper</p>
+              </div>
+              <input
+                value={tailnetHost}
+                onChange={e => setTailnetHost(e.target.value)}
+                placeholder="hostname.tailnet.ts.net"
+                className="w-full bg-white border-[2px] border-[#111] px-2 py-1.5 font-mono text-[9px] focus:outline-none focus:border-[#22c55e]"
+              />
+              <div className="grid grid-cols-2 gap-2">
+                <select
+                  value={tailscaleScheme}
+                  onChange={e => setTailscaleScheme(e.target.value)}
+                  className="w-full bg-white border-[2px] border-[#111] px-2 py-1.5 font-mono text-[9px] focus:outline-none focus:border-[#22c55e]"
+                >
+                  <option value="http">http</option>
+                  <option value="https">https</option>
+                </select>
+                <input
+                  value={tailscalePort}
+                  onChange={e => setTailscalePort(e.target.value)}
+                  placeholder="5190"
+                  className="w-full bg-white border-[2px] border-[#111] px-2 py-1.5 font-mono text-[9px] focus:outline-none focus:border-[#22c55e]"
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={applyTailscaleEndpoint}
+                  className="px-3 py-1.5 border-[2px] border-[#111] bg-[#111] text-[#22c55e] font-mono text-[9px] font-black uppercase hover:bg-[#222]"
+                >
+                  Use for API
+                </button>
+                <button
+                  onClick={copyMobileUrl}
+                  className="inline-flex items-center gap-1 px-3 py-1.5 border-[2px] border-[#111] bg-white text-[#111] font-mono text-[9px] font-black uppercase hover:bg-[#eee]"
+                >
+                  <Copy size={10} />
+                  Copy Mobile URL
+                </button>
+              </div>
+              {tailscaleHint && <p className="font-mono text-[8px] text-[#555]">{tailscaleHint}</p>}
+              <p className="font-mono text-[7px] text-[#777]">Tip: keep this as http on Tailnet; use https only when serving through Funnel/TLS.</p>
             </div>
 
             <div className="p-3 border-[3px] border-[#111] bg-[#f5f5f0] space-y-2">
