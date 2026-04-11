@@ -2063,12 +2063,31 @@ const PreviewPanel = ({ content, filePath, onClose }) => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [lang, setLang] = useState('');
+  const [viewMode, setViewMode] = useState(() => localStorage.getItem('80m-preview-last-mode') || 'auto');
+  const [modePrefs, setModePrefs] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('80m-preview-mode-prefs') || '{}'); } catch { return {}; }
+  });
+  const [pdfBlobUrl, setPdfBlobUrl] = useState('');
 
   // Detect language from file extension
   const detectLang = (path) => {
     const ext = (path || '').split('.').pop().toLowerCase();
     const map = { js: 'javascript', jsx: 'jsx', ts: 'typescript', tsx: 'tsx', py: 'python', rs: 'rust', go: 'go', css: 'css', html: 'html', json: 'json', md: 'markdown', sh: 'bash', yml: 'yaml', yaml: 'yaml', toml: 'toml' };
     return map[ext] || ext || 'text';
+  };
+
+  const detectDocType = (path = '', text = '') => {
+    const ext = (path.split('.').pop() || '').toLowerCase();
+    const codeExts = new Set(['js', 'jsx', 'ts', 'tsx', 'py', 'rs', 'go', 'css', 'scss', 'html', 'json', 'sh', 'yml', 'yaml', 'toml', 'java', 'kt', 'c', 'cpp', 'h', 'hpp', 'rb', 'php', 'swift']);
+    const docExts = new Set(['md', 'txt', 'rst', 'adoc']);
+    const unsupportedDocExts = new Set(['doc', 'docx', 'rtf', 'odt']);
+    if (ext === 'pdf' || /^%PDF/m.test(text)) return 'pdf';
+    if (codeExts.has(ext)) return 'code';
+    if (docExts.has(ext)) return 'doc';
+    if (unsupportedDocExts.has(ext)) return 'unsupported-doc';
+    if (text.startsWith('```') || /^(import|export|const|function|class|def|fn|pub|package)\s/m.test(text)) return 'code';
+    if (text.includes('# ') || text.includes('## ') || text.includes('**') || text.includes('- [ ]')) return 'doc';
+    return 'doc';
   };
 
   // Fetch file content when filePath changes
@@ -2098,10 +2117,62 @@ const PreviewPanel = ({ content, filePath, onClose }) => {
     }
   }, [filePath]);
 
+  useEffect(() => {
+    localStorage.setItem('80m-preview-last-mode', viewMode);
+  }, [viewMode]);
+
+  useEffect(() => {
+    if (!filePath) return;
+    const ext = (filePath.split('.').pop() || '').toLowerCase();
+    if (modePrefs[ext]) setViewMode(modePrefs[ext]);
+  }, [filePath, modePrefs]);
+
+  useEffect(() => {
+    let objectUrl = '';
+    const type = detectDocType(filePath || '', fileContent || content || '');
+    if (type !== 'pdf' || !filePath || filePath.startsWith('http://') || filePath.startsWith('https://')) {
+      setPdfBlobUrl('');
+      return;
+    }
+
+    const loadPdf = async () => {
+      try {
+        const candidates = [
+          `/fs/raw?path=${encodeURIComponent(filePath)}`,
+          `${LOCAL_API_BASE}/fs/raw?path=${encodeURIComponent(filePath)}`,
+          `/fs/read?path=${encodeURIComponent(filePath)}`,
+          `${LOCAL_API_BASE}/fs/read?path=${encodeURIComponent(filePath)}`,
+        ];
+        for (const url of candidates) {
+          try {
+            const res = await fetch(url);
+            if (!res.ok) continue;
+            const blob = await res.blob();
+            if (blob.size === 0) continue;
+            objectUrl = URL.createObjectURL(blob);
+            setPdfBlobUrl(objectUrl);
+            return;
+          } catch {}
+        }
+      } catch {}
+    };
+    loadPdf();
+
+    return () => {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [filePath, fileContent, content]);
+
   const displayContent = fileContent || content || '';
-  const isCode = displayContent.startsWith('```') || /^(import|export|const|function|class|def|fn|pub|package|import)\s/m.test(displayContent) || displayContent.includes('{') && displayContent.includes('}');
-  const isMarkdown = displayContent.includes('# ') || displayContent.includes('## ') || displayContent.includes('**') || displayContent.includes('- [ ]') || displayContent.includes('```');
+  const autoType = detectDocType(filePath, displayContent);
+  const preferredMode = filePath ? modePrefs[(filePath.split('.').pop() || '').toLowerCase()] : '';
+  const effectiveView = viewMode === 'auto' ? (preferredMode || autoType) : viewMode;
   const effectiveLang = lang || detectLang(filePath);
+  const previewSource = pdfBlobUrl || (filePath
+    ? (filePath.startsWith('http://') || filePath.startsWith('https://')
+      ? filePath
+      : `${LOCAL_API_BASE}/fs/read?path=${encodeURIComponent(filePath)}`)
+    : '');
 
   return (
     <div className="flex-1 flex flex-col border-l-[4px] border-[#111] bg-[#fafaf5] overflow-hidden">
@@ -2118,6 +2189,26 @@ const PreviewPanel = ({ content, filePath, onClose }) => {
         </div>
         <button onClick={onClose} className="p-1 hover:text-[#ef4444] transition-colors flex-shrink-0"><X size={12} /></button>
       </div>
+      <div className="px-4 py-2 border-b-[2px] border-[#111] bg-[#f5f4ed] flex items-center gap-2">
+        {['auto', 'code', 'doc', 'pdf', 'raw'].map(mode => (
+          <button
+            key={mode}
+            onClick={() => {
+              setViewMode(mode);
+              if (!filePath) return;
+              const ext = (filePath.split('.').pop() || '').toLowerCase();
+              const nextPrefs = { ...modePrefs };
+              if (mode === 'auto') delete nextPrefs[ext];
+              else nextPrefs[ext] = mode;
+              setModePrefs(nextPrefs);
+              localStorage.setItem('80m-preview-mode-prefs', JSON.stringify(nextPrefs));
+            }}
+            className={`px-2 py-1 border-[2px] font-mono text-[8px] font-black uppercase transition-colors ${viewMode === mode ? 'bg-[#111] text-[#22c55e] border-[#111]' : 'bg-white text-[#111] border-[#111] hover:text-[#22c55e]'}`}
+          >
+            {mode}
+          </button>
+        ))}
+      </div>
       <div className="flex-1 overflow-auto p-4 custom-scrollbar">
         {loading ? (
           <div className="flex items-center justify-center h-full">
@@ -2132,15 +2223,46 @@ const PreviewPanel = ({ content, filePath, onClose }) => {
             <p className="font-mono text-[10px] text-[#ef4444] font-black uppercase">{error}</p>
             <p className="font-mono text-[8px] text-[#aaa] mt-1">File path: {filePath}</p>
           </div>
-        ) : isCode ? (
+        ) : effectiveView === 'pdf' ? (
+          previewSource ? (
+            <iframe
+              title="PDF Preview"
+              src={previewSource}
+              className="w-full h-full min-h-[60vh] border-[3px] border-[#111] bg-white"
+            />
+          ) : (
+            <div className="p-4 border-[3px] border-[#111] bg-white font-mono text-[9px]">
+              Select a .pdf file path or URL to preview.
+            </div>
+          )
+        ) : effectiveView === 'code' ? (
           <pre className={`font-mono text-[11px] whitespace-pre-wrap break-all bg-[#1a1a2e] text-[#a8dadc] p-4 border-[3px] border-[#111] shadow-[4px_4px_0_0_#111] overflow-auto lang-${effectiveLang}`}>
             <code>{displayContent}</code>
           </pre>
+        ) : effectiveView === 'raw' ? (
+          <pre className="font-mono text-[10px] whitespace-pre-wrap break-all bg-white p-4 border-[3px] border-[#111] shadow-[4px_4px_0_0_#111] overflow-auto text-[#111]">
+            {displayContent || 'No content to preview.'}
+          </pre>
+        ) : autoType === 'unsupported-doc' ? (
+          <div className="p-4 border-[3px] border-[#f59e0b] bg-[#fffbeb]">
+            <p className="font-mono text-[10px] text-[#92400e] font-black uppercase">
+              Rich document format detected ({(filePath || '').split('.').pop()?.toLowerCase()}).
+            </p>
+            <p className="font-mono text-[9px] text-[#92400e] mt-2">
+              For best preview results, export this file to .txt or .md, then open it again.
+            </p>
+          </div>
         ) : (
-          <div className="prose-custom font-serif text-[#111] leading-relaxed">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>
-              {displayContent || '_No content to preview_'}
-            </ReactMarkdown>
+          <div className="prose-custom font-serif text-[#111] leading-relaxed border-[2px] border-transparent">
+            {displayContent?.includes('# ') || displayContent?.includes('```') || displayContent?.includes('- ') ? (
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {displayContent || '_No content to preview_'}
+              </ReactMarkdown>
+            ) : (
+              <div className="font-mono text-[11px] whitespace-pre-wrap break-words">
+                {displayContent || 'No content to preview.'}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -3613,7 +3735,7 @@ export default function App() {
                           setPathInputValue('');
                         }
                       }}
-                      className={`p-1.5 transition-all ${splitView ? 'text-[#22c55e]' : 'text-[#111] hover:text-[#22c55e]'}`}
+                      className={`p-1.5 transition-all ${splitView ? 'text-[#111] drop-shadow-[0_0_8px_rgba(34,197,94,0.9)]' : 'text-[#111] hover:text-[#111] hover:drop-shadow-[0_0_10px_rgba(34,197,94,0.95)]'}`}
                       title={splitView ? 'Exit Preview Mode' : 'Preview Mode'}
                     >
                       <Eye size={15} strokeWidth={2.5} />
