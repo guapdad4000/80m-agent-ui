@@ -3014,6 +3014,19 @@ export default function App() {
   const scrollRef = useRef(null);
 
   const [messages, _rawSetMessages] = useState(() => loadMessages());
+  const messageIdRef = useRef(0);
+  useEffect(() => {
+    const maxExistingId = messages.reduce((maxId, msg) => {
+      const parsed = Number(msg?.id);
+      return Number.isFinite(parsed) ? Math.max(maxId, parsed) : maxId;
+    }, 0);
+    if (maxExistingId > messageIdRef.current) messageIdRef.current = maxExistingId;
+  }, [messages]);
+  const nextMessageId = useCallback(() => {
+    const now = Date.now();
+    messageIdRef.current = Math.max(now, messageIdRef.current + 1);
+    return messageIdRef.current;
+  }, []);
   // Wrap setMessages to update ref + localStorage synchronously on every update
   const setMessages = useCallback((update) => {
     _rawSetMessages(prev => {
@@ -3304,7 +3317,7 @@ export default function App() {
     ].join('\n');
 
     setMessages(prev => [...prev, {
-      id: Date.now() + 2,
+      id: nextMessageId(),
       role: 'assistant',
       employee: activeEmployee,
       content: summary,
@@ -3347,7 +3360,8 @@ export default function App() {
       ? `[${projectNamespace || 'global'}] `
       : '';
     const displayMsg = contextPrefix + inputValue;
-    setMessages(prev => [...prev, { id: Date.now(), role: 'user', content: displayMsg }]);
+    const userMsgId = nextMessageId();
+    setMessages(prev => [...prev, { id: userMsgId, role: 'user', content: displayMsg }]);
     setInputValue('');
     playSendClick();
     pulseMascot('jump', 500);
@@ -3358,7 +3372,7 @@ export default function App() {
       // --- Offline-aware: queue if Hermes is unreachable ---
       if (!isHermesConnected || !isOnline) {
         const queuedId = queueMessage({ text: displayMsg, agent: activeEmployee });
-        const assistantMsgId = Date.now() + 1;
+        const assistantMsgId = nextMessageId();
         setMessages(prev => [...prev, {
           id: assistantMsgId,
           role: 'assistant',
@@ -3372,7 +3386,7 @@ export default function App() {
 
       setAgentState('processing');
       setAgentThinking(true);
-      const assistantMsgId = Date.now() + 1;
+      const assistantMsgId = nextMessageId();
       setToolEventsByMsg(prev => ({ ...prev, [assistantMsgId]: [] }));
 
       // Add placeholder assistant message (empty, we'll fill it when the job completes)
@@ -3461,7 +3475,7 @@ export default function App() {
     } else {
       // Demo mode — original animated simulation
       setAgentState('processing');
-      const demoMsgId = Date.now() + 1;
+      const demoMsgId = nextMessageId();
       setTimeout(() => {
         setAgentState('searching');
         const searchEvent = { type: 'tool', tool: 'websearch', input: inputValue, output: 'Found 3 relevant documents' };
