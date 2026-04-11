@@ -2613,6 +2613,56 @@ const HeaderStatusFrame = ({ state }) => {
   );
 };
 
+// --- PR-3: Onboarding wizard ---
+const ONBOARDING_STEPS = [
+  { title: 'Welcome to 80M', desc: 'This quick wizard will connect Hermes and tune your workspace.', mascotState: 'jump' },
+  { title: 'Configure Endpoints', desc: 'Open Settings → Connection and save Hermes, Local API, and Webhook bases.', mascotState: 'processing' },
+  { title: 'Run Health Check', desc: 'Use "Run System Diagnostics" to verify Hermes sessions, fs, and webhooks.', mascotState: 'searching' },
+  { title: 'Execute First Prompt', desc: 'Pick an agent and send a test task. You are now mission-ready.', mascotState: 'job-done' },
+];
+
+const OnboardingWizard = ({ step, onNext, onBack, onFinish }) => {
+  const current = ONBOARDING_STEPS[step] || ONBOARDING_STEPS[0];
+  const isLast = step === ONBOARDING_STEPS.length - 1;
+
+  return (
+    <div className="fixed inset-0 z-[250] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
+      <div className="w-full max-w-4xl border-[4px] border-[#111] bg-[#eae7de] shadow-[10px_10px_0_0_#111] grid lg:grid-cols-[1fr_1.2fr] gap-4 p-4">
+        <div className="h-64 lg:h-[420px] border-[3px] border-[#111] bg-white p-2">
+          <AtmMascot state={current.mascotState} />
+        </div>
+        <div className="flex flex-col justify-between p-2 space-y-4">
+          <div className="space-y-3">
+            <p className="font-mono text-[10px] font-black uppercase tracking-[0.2em] text-[#22c55e]">
+              Setup_Wizard {step + 1}/{ONBOARDING_STEPS.length}
+            </p>
+            <h2 className="font-serif text-3xl font-black text-[#111] tracking-tight">{current.title}</h2>
+            <p className="font-mono text-sm text-[#333] leading-relaxed">{current.desc}</p>
+          </div>
+          <div className="flex items-center justify-between">
+            <button
+              onClick={onBack}
+              disabled={step === 0}
+              className="px-4 py-2 border-[3px] border-[#111] bg-white font-mono text-[10px] font-black uppercase disabled:opacity-40"
+            >
+              Back
+            </button>
+            {isLast ? (
+              <button onClick={onFinish} className="px-5 py-2 border-[3px] border-[#111] bg-[#22c55e] font-mono text-[10px] font-black uppercase">
+                Finish Setup
+              </button>
+            ) : (
+              <button onClick={onNext} className="px-5 py-2 border-[3px] border-[#111] bg-[#111] text-[#22c55e] font-mono text-[10px] font-black uppercase">
+                Next
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const MessageMarkdown = ({ content, role = 'assistant' }) => {
   const isUser = role === 'user';
   const baseText = isUser ? 'text-[#111]' : 'text-[#e8e8ec]';
@@ -2675,6 +2725,9 @@ export default function App() {
   const [previewFilePath, setPreviewFilePath] = useState('');
   const [showPathInput, setShowPathInput] = useState(false);
   const [pathInputValue, setPathInputValue] = useState('');
+  const [showOnboarding, setShowOnboarding] = useState(() => !localStorage.getItem('80m-onboarding-complete'));
+  const [onboardingStep, setOnboardingStep] = useState(0);
+  const [messageCount, setMessageCount] = useState(0);
 
   // --- Offline support ---
   const [queuedCount, setQueuedCount] = useState(() => getQueue().length);
@@ -2747,9 +2800,20 @@ export default function App() {
   const [isRecording, setIsRecording] = useState(false);
   const recordingRef = useRef(false);
   const recognitionRef = useRef(null);
+  const mascotTimerRef = useRef(null);
 
   // --- New: Audio feedback (Web Audio API) ---
   const { unlock, playSendClick, playAgentChime } = useAudio();
+
+  const pulseMascot = useCallback((state, holdMs = 1200) => {
+    setAgentState(state);
+    if (mascotTimerRef.current) clearTimeout(mascotTimerRef.current);
+    mascotTimerRef.current = setTimeout(() => setAgentState('default'), holdMs);
+  }, []);
+
+  useEffect(() => () => {
+    if (mascotTimerRef.current) clearTimeout(mascotTimerRef.current);
+  }, []);
 
   // Unlock audio on first user interaction
   useEffect(() => {
@@ -2948,6 +3012,12 @@ export default function App() {
     setShowPWAInstall(false);
   };
 
+  const finishOnboarding = () => {
+    localStorage.setItem('80m-onboarding-complete', '1');
+    setShowOnboarding(false);
+    pulseMascot('job-done', 1600);
+  };
+
   // --- Command palette actions ---
   const runSystemDiagnostics = async () => {
     const check = async (name, fn) => {
@@ -2995,8 +3065,10 @@ export default function App() {
       employee: activeEmployee,
       content: summary,
     }]);
+    // Both our state update and mascot pulse for diagnostics completion
     setAgentState('job-done');
     setTimeout(() => setAgentState('default'), 1200);
+    pulseMascot(passed === checks.length ? 'job-done' : 'urgent', 1500);
   };
 
   const commandActions = [
@@ -3034,6 +3106,8 @@ export default function App() {
     setMessages(prev => [...prev, { id: Date.now(), role: 'user', content: displayMsg }]);
     setInputValue('');
     playSendClick();
+    pulseMascot('jump', 500);
+    if (inputValue.toLowerCase().includes('lobster')) pulseMascot('lobster', 1800);
 
     // If API is enabled, make a real request
     if (config.apiEnabled && config.apiEndpoint) {
@@ -3048,6 +3122,7 @@ export default function App() {
           content: `[Message queued — will send when Hermes reconnects. Queue: ${queueCount + 1}]`,
         }]);
         setQueuedCount(q => q + 1);
+        pulseMascot('sleep', 1600);
         return;
       }
 
@@ -3076,6 +3151,7 @@ export default function App() {
         const submitData = await submitRes.json();
         const jobId = submitData.job_id;
         if (jobId) {
+          pulseMascot('searching', 1200);
           let completed = false;
           const streamed = await tryStreamJobViaSSE({ baseUrl: HERMES_BASE, jobId });
           if (streamed?.completed) {
@@ -3120,9 +3196,12 @@ export default function App() {
           if (!responseText) throw new Error('No response payload from endpoint');
           setMessages(prev => prev.map(m => m.id === assistantMsgId ? { ...m, content: responseText } : m));
         }
-
+        // SSE completion: update state + mascot animation
         setAgentState('job-done');
         setTimeout(() => setAgentState('default'), 1500);
+        const nextCount = messageCount + 1;
+        setMessageCount(nextCount);
+        pulseMascot(nextCount % 5 === 0 ? 'jackpot' : 'job-done', 1500);
       } catch (err) {
         // On error, queue the message for retry instead of showing error
         const queuedId = queueMessage({ text: displayMsg, agent: activeEmployee });
@@ -3131,7 +3210,7 @@ export default function App() {
           content: `[Connection lost — message queued. Will retry when Hermes reconnects.]`,
         } : m));
         setQueuedCount(q => q + 1);
-        setAgentState('default');
+        pulseMascot('error', 1800);
       } finally {
         setAgentThinking(false);
       }
@@ -3150,7 +3229,7 @@ export default function App() {
           setToolEventsByMsg(prev => ({ ...prev, [demoMsgId]: [...(prev[demoMsgId] || []), codeEvent] }));
           setMessages(prev => [...prev, { id: demoMsgId, role: 'assistant', employee: activeEmployee, content: `Protocol initiated by ${activeEmployee}. Analyzing parameters for "${inputValue}". local server hooks validated.` }]);
       }, 2000);
-      setTimeout(() => setAgentState('job-done'), 4000);
+      setTimeout(() => setAgentState(inputValue.toLowerCase().includes('lobster') ? 'lobster' : 'job-done'), 4000);
       setTimeout(() => setAgentState('default'), 5500);
     }
   };
@@ -3797,6 +3876,17 @@ export default function App() {
             <div className="fixed inset-0 z-[160] flex items-center justify-center bg-black/30 backdrop-blur-sm p-4">
               <WebhookPanel onClose={() => setShowWebhook(false)} />
             </div>
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {showOnboarding && (
+            <OnboardingWizard
+              step={onboardingStep}
+              onBack={() => setOnboardingStep(s => Math.max(0, s - 1))}
+              onNext={() => setOnboardingStep(s => Math.min(ONBOARDING_STEPS.length - 1, s + 1))}
+              onFinish={finishOnboarding}
+            />
           )}
         </AnimatePresence>
 
