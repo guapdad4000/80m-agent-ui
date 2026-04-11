@@ -43,7 +43,16 @@ import {
   RefreshCw,
   FileText,
   Keyboard,
+  List,
+  Cpu,
+  UserCircle,
+  Tag,
+  Clock3,
 } from 'lucide-react';
+import useHermesApi from './hooks/useHermesApi';
+import useOffline from './hooks/useOffline';
+import ShareHandler from './ShareHandler';
+import { getQueue, processQueue, queueMessage } from './offlineQueue';
 
 // =====================================================================
 // USE AUDIO HOOK — Web Audio API for subtle UI sounds
@@ -127,10 +136,10 @@ const useAudio = () => {
 // =====================================================================
 // WAVEFORM INDICATOR — canvas-based animated bars
 // =====================================================================
-const WaveformIndicator = ({ agentState, isRecording }) => {
+const WaveformIndicator = ({ agentState, isRecording, agentThinking }) => {
   const canvasRef = useRef(null);
   const rafRef = useRef(null);
-  const isActive = isRecording || ['processing', 'typing', 'searching', 'urgent'].includes(agentState);
+  const isActive = isRecording || agentThinking || ['processing', 'typing', 'searching', 'urgent'].includes(agentState);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -201,16 +210,19 @@ const WaveformIndicator = ({ agentState, isRecording }) => {
 // =====================================================================
 // DEFAULT AGENT CONFIG — user-configurable via Settings
 // =====================================================================
+const HERMES_BASE = 'http://localhost:5174';
+const LOCAL_API_BASE = 'http://localhost:5175';
+const HERMES_HTTP = HERMES_BASE;
 const DEFAULT_CONFIG = {
   apiEndpoint: 'http://localhost:5174/chat',
   apiEnabled: true,
   agents: [
-    { id: 'Hermes', icon: 'Bot', role: 'Generalist', color: '#22c55e' },
-    { id: 'Researcher', icon: 'Search', role: 'Scraper', color: '#3b82f6' },
-    { id: 'Writer', icon: 'PenTool', role: 'Synthesis', color: '#f59e0b' },
-    { id: 'Editor', icon: 'CheckCircle2', role: 'Auditor', color: '#ef4444' },
+    { id: 'prawnius', icon: 'Bot', role: 'Quick Tasks', color: '#22c55e' },
+    { id: 'claudnelius', icon: 'PenTool', role: 'Code & Design', color: '#3b82f6' },
+    { id: 'knowledge_knaight', icon: 'Search', role: 'Research', color: '#f59e0b' },
+    { id: 'clawdette', icon: 'CheckCircle2', role: 'Operations', color: '#ef4444' },
   ],
-  welcomeMessage: 'SYSTEM_ONLINE. Sovereign Agent Council ready for deployment. What shall we automate?',
+  welcomeMessage: '',
   showPWAInstall: true,
 };
 
@@ -257,7 +269,7 @@ const loadMessages = () => {
     const saved = localStorage.getItem('80m-agent-messages');
     if (saved) return JSON.parse(saved);
   } catch {}
-  return [{ id: 1, role: 'assistant', employee: 'Hermes', content: 'SYSTEM_ONLINE. Sovereign Agent Council ready for deployment. What shall we automate?' }];
+  return [];
 };
 
 const saveMessages = (msgs) => {
@@ -333,7 +345,7 @@ const SettingsPanel = ({ config, onSave, onClose }) => {
       const res = await fetch(localConfig.apiEndpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: 'ping', stream: false }),
+        body: JSON.stringify({ message: 'ping', agent_id: activeEmployee }),
         signal: AbortSignal.timeout(8000),
       });
       const text = await res.text();
@@ -343,11 +355,25 @@ const SettingsPanel = ({ config, onSave, onClose }) => {
     }
   };
 
+  const BEHAVIOR_PRESETS = [
+    { value: 'focused', label: 'FOCUSED — task-oriented, minimal chatter' },
+    { value: 'chatty', label: 'CHATTY — verbose, explains reasoning' },
+    { value: 'silent', label: 'SILENT — terse responses only' },
+    { value: 'creative', label: 'CREATIVE — exploratory, brainstorming' },
+    { value: 'technical', label: 'TECHNICAL — precise, code-first' },
+  ];
+
+  // Profile presets for named agent configurations
+  const [profiles, setProfiles] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('80m-agent-profiles')) || []; } catch { return []; }
+  });
+  const [profileName, setProfileName] = useState('');
+
   const addAgent = () => {
     const id = `Agent_${Date.now()}`;
     setLocalConfig(prev => ({
       ...prev,
-      agents: [...prev.agents, { id, icon: 'Bot', role: 'Custom', color: '#888888' }],
+      agents: [...prev.agents, { id, icon: 'Bot', role: 'New Agent', color: '#888888', systemPrompt: '', avatarEmoji: '', behavior: 'focused' }],
     }));
   };
 
@@ -361,6 +387,48 @@ const SettingsPanel = ({ config, onSave, onClose }) => {
       ...prev,
       agents: prev.agents.map(a => a.id === id ? { ...a, [field]: value } : a),
     }));
+  };
+
+  const saveProfile = () => {
+    if (!profileName.trim()) { alert('Enter a profile name'); return; }
+    const newProfile = { id: Date.now().toString(36), name: profileName.trim(), agents: JSON.parse(JSON.stringify(localConfig.agents)) };
+    setProfiles(prev => { const updated = [...prev.filter(p => p.name !== newProfile.name), newProfile]; localStorage.setItem('80m-agent-profiles', JSON.stringify(updated)); return updated; });
+    setProfileName('');
+  };
+
+  const loadProfile = (profileId) => {
+    const profile = profiles.find(p => p.id === profileId);
+    if (profile) setLocalConfig(prev => ({ ...prev, agents: JSON.parse(JSON.stringify(profile.agents)) }));
+  };
+
+  const deleteProfile = (profileId) => {
+    setProfiles(prev => { const updated = prev.filter(p => p.id !== profileId); localStorage.setItem('80m-agent-profiles', JSON.stringify(updated)); return updated; });
+  };
+
+  const exportProfile = (profile) => {
+    const blob = new Blob([JSON.stringify(profile, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = `80m-profile-${profile.name}.json`; a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const importProfile = () => {
+    const input = document.createElement('input'); input.type = 'file'; input.accept = '.json';
+    input.onchange = (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        try {
+          const parsed = JSON.parse(ev.target.result);
+          if (parsed.agents) {
+            setProfiles(prev => { const updated = [...prev, { ...parsed, id: Date.now().toString(36) }]; localStorage.setItem('80m-agent-profiles', JSON.stringify(updated)); return updated; });
+          } else { alert('Invalid profile file'); }
+        } catch { alert('Invalid JSON file'); }
+      };
+      reader.readAsText(file);
+    };
+    input.click();
   };
 
   const tabs = [
@@ -490,6 +558,39 @@ const SettingsPanel = ({ config, onSave, onClose }) => {
         {/* AGENTS TAB */}
         {activeTab === 'agents' && (
           <div className="space-y-3">
+            {/* Profile presets */}
+            <div className="p-3 border-[3px] border-[#22c55e] bg-white space-y-2">
+              <p className="font-mono text-[9px] font-black uppercase text-[#555]">PROFILE_PRESETS</p>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={profileName}
+                  onChange={e => setProfileName(e.target.value)}
+                  placeholder="Profile name..."
+                  className="flex-1 bg-[#f5f5f0] border-[2px] border-[#111] px-2 py-1.5 font-mono text-[9px] focus:outline-none focus:border-[#22c55e]"
+                  onKeyDown={e => e.key === 'Enter' && saveProfile()}
+                />
+                <button onClick={saveProfile} className="px-3 py-1.5 bg-[#22c55e] text-[#111] border-[2px] border-[#111] font-mono text-[9px] font-black uppercase hover:bg-[#111] hover:text-[#22c55e] transition-colors">
+                  <Save size={10} />
+                </button>
+              </div>
+              {profiles.length > 0 && (
+                <div className="flex flex-wrap gap-1">
+                  {profiles.map(p => (
+                    <div key={p.id} className="flex items-center gap-1 px-2 py-1 bg-[#f5f5f0] border-[2px] border-[#ddd]">
+                      <span className="font-mono text-[8px] font-black uppercase">{p.name}</span>
+                      <button onClick={() => loadProfile(p.id)} className="text-[#22c55e] hover:text-[#111] transition-colors"><Check size={8} /></button>
+                      <button onClick={() => exportProfile(p)} className="text-[#888] hover:text-[#111] transition-colors"><Download size={8} /></button>
+                      <button onClick={() => deleteProfile(p.id)} className="text-[#ef4444] hover:text-[#111] transition-colors"><Trash2 size={8} /></button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <button onClick={importProfile} className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-white border-[2px] border-[#111] font-mono text-[8px] font-black uppercase hover:bg-[#111] hover:text-[#eae7de] transition-colors">
+                <Upload size={10} /> IMPORT PROFILE
+              </button>
+            </div>
+
             <div className="flex items-center justify-between">
               <p className="font-mono text-[9px] font-black uppercase text-[#555]">AGENT_COUNCIL_MEMBERS</p>
               <button
@@ -533,7 +634,43 @@ const SettingsPanel = ({ config, onSave, onClose }) => {
                       className="w-full h-[26px] border-[2px] border-[#111] cursor-pointer"
                     />
                   </div>
+                  <div>
+                    <label className="font-mono text-[7px] uppercase opacity-50">Emoji Avatar</label>
+                    <input
+                      value={agent.avatarEmoji || ''}
+                      onChange={e => updateAgent(agent.id, 'avatarEmoji', e.target.value)}
+                      placeholder="e.g. 🤖"
+                      className="w-full font-mono text-[10px] bg-[#f5f5f0] border-[2px] border-[#ddd] px-2 py-1 focus:outline-none focus:border-[#111]"
+                    />
+                  </div>
+                  <div>
+                    <label className="font-mono text-[7px] uppercase opacity-50">Behavior</label>
+                    <select
+                      value={agent.behavior || 'focused'}
+                      onChange={e => updateAgent(agent.id, 'behavior', e.target.value)}
+                      className="w-full font-mono text-[9px] bg-[#f5f5f0] border-[2px] border-[#ddd] px-2 py-1 focus:outline-none focus:border-[#111]"
+                    >
+                      {BEHAVIOR_PRESETS.map(p => (
+                        <option key={p.value} value={p.value}>{p.label.split(' — ')[0]}</option>
+                      ))}
+                    </select>
+                  </div>
                 </div>
+                <div>
+                  <label className="font-mono text-[7px] uppercase opacity-50">System Prompt Snippet</label>
+                  <textarea
+                    value={agent.systemPrompt || ''}
+                    onChange={e => updateAgent(agent.id, 'systemPrompt', e.target.value)}
+                    placeholder="Instructions for this agent..."
+                    rows={2}
+                    className="w-full font-mono text-[9px] bg-[#f5f5f0] border-[2px] border-[#ddd] px-2 py-1 focus:outline-none focus:border-[#111] resize-none"
+                  />
+                </div>
+                {BEHAVIOR_PRESETS.find(p => p.value === agent.behavior) && (
+                  <p className="font-mono text-[7px] text-[#888] italic">
+                    {BEHAVIOR_PRESETS.find(p => p.value === agent.behavior).label.split(' — ')[1]}
+                  </p>
+                )}
               </div>
             ))}
           </div>
@@ -711,6 +848,524 @@ const SettingsPanel = ({ config, onSave, onClose }) => {
 };
 
 // =====================================================================
+// MEMORY BROWSER — searches Fabric memory via Hermes chat endpoint
+// Replaces KnowledgeVaultPanel stub
+// =====================================================================
+const MemoryBrowserPanel = ({ onClose }) => {
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [activeTab, setActiveTab] = useState('search'); // 'search' | 'recent'
+  const [expandedId, setExpandedId] = useState(null);
+
+  const handleSearch = async (e) => {
+    e.preventDefault();
+    if (!query.trim()) return;
+    setLoading(true);
+    setError('');
+    try {
+      const res = await fetch('http://localhost:5174/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: `Search my fabric memory for: ${query.trim()}`,
+          agent_id: 'prawnius',
+        }),
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      setResults([{
+        id: Date.now().toString(36),
+        title: `Results for "${query}"`,
+        content: text,
+        date: new Date().toLocaleString(),
+        agent: 'fabric',
+        score: null,
+      }]);
+    } catch (err) {
+      setError(`Search failed: ${err.message}`);
+    }
+    setLoading(false);
+  };
+
+  const loadRecent = async () => {
+    setLoading(true);
+    setError('');
+    setActiveTab('recent');
+    try {
+      const res = await fetch('http://localhost:5174/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: 'Show me my 10 most recent Fabric memory entries with titles and dates',
+          agent_id: 'prawnius',
+        }),
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      setResults([{
+        id: 'recent',
+        title: 'Recent Memories',
+        content: text,
+        date: new Date().toLocaleString(),
+        agent: 'fabric',
+        score: null,
+      }]);
+    } catch (err) {
+      setError(`Could not load recent memories: ${err.message}`);
+    }
+    setLoading(false);
+  };
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 20 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: 20 }}
+      className="border-[3px] border-[#111] bg-white shadow-[6px_6px_0_0_#111] p-4 max-w-md mx-auto max-h-[80vh] flex flex-col"
+    >
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <Brain size={16} className="text-[#111]" />
+          <span className="font-mono text-[10px] font-black uppercase">Memory_Browser</span>
+        </div>
+        <button onClick={onClose} className="p-1 hover:text-[#ef4444] transition-colors"><X size={14} /></button>
+      </div>
+
+      {/* Tabs */}
+      <div className="flex gap-1 mb-3">
+        <button
+          onClick={() => setActiveTab('search')}
+          className={`px-3 py-1.5 font-mono text-[8px] font-black uppercase border-[2px] border-[#111] transition-colors ${activeTab === 'search' ? 'bg-[#111] text-[#22c55e]' : 'bg-white text-[#111] hover:bg-[#f5f5f0]'}`}
+        >SEARCH</button>
+        <button
+          onClick={() => { setActiveTab('recent'); if (results.length === 0 || activeTab !== 'recent') loadRecent(); }}
+          className={`px-3 py-1.5 font-mono text-[8px] font-black uppercase border-[2px] border-[#111] transition-colors ${activeTab === 'recent' ? 'bg-[#111] text-[#22c55e]' : 'bg-white text-[#111] hover:bg-[#f5f5f0]'}`}
+        >RECENT</button>
+      </div>
+
+      {/* Search form */}
+      {activeTab === 'search' && (
+        <form onSubmit={handleSearch} className="flex gap-2 mb-3">
+          <input
+            type="text"
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+            placeholder="Search memory..."
+            className="flex-1 bg-[#f5f5f0] border-[2px] border-[#111] px-3 py-2 font-mono text-xs focus:outline-none focus:border-[#22c55e]"
+          />
+          <button type="submit" className="px-4 py-2 bg-[#111] text-[#22c55e] font-mono text-[10px] font-black uppercase border-[2px] border-[#111] hover:bg-[#222]">
+            {loading ? '...' : 'GO'}
+          </button>
+        </form>
+      )}
+
+      {/* Results */}
+      <div className="flex-1 overflow-y-auto space-y-2 custom-scrollbar">
+        {loading && (
+          <div className="flex justify-center py-6">
+            <div className="flex gap-1">
+              <div className="w-2 h-2 bg-[#22c55e] rounded-full animate-bounce [animation-delay:-0.3s]"></div>
+              <div className="w-2 h-2 bg-[#22c55e] rounded-full animate-bounce [animation-delay:-0.15s]"></div>
+              <div className="w-2 h-2 bg-[#22c55e] rounded-full animate-bounce"></div>
+            </div>
+          </div>
+        )}
+        {error && (
+          <div className="p-2 border-[2px] border-[#ef4444] bg-[#fef2f2]">
+            <p className="font-mono text-[9px] text-[#ef4444]">{error}</p>
+          </div>
+        )}
+        {results.length === 0 && !loading && !error && (
+          <p className="font-mono text-[9px] text-[#999] text-center py-4">
+            {activeTab === 'search' ? 'Search your Fabric memory.' : 'Click Recent to load memories.'}
+          </p>
+        )}
+        {results.map(r => (
+          <div key={r.id} className="border-[2px] border-[#ddd] hover:border-[#111] transition-all">
+            <div
+              onClick={() => setExpandedId(expandedId === r.id ? null : r.id)}
+              className="flex items-start gap-2 p-2 cursor-pointer"
+            >
+              <div className="flex-1 min-w-0">
+                <p className="font-mono text-[10px] font-black uppercase truncate">{r.title}</p>
+                <div className="flex items-center gap-2 mt-0.5">
+                  <span className="font-mono text-[7px] text-[#888]">{r.date}</span>
+                  {r.agent && <span className="font-mono text-[7px] text-[#22c55e]">@{r.agent}</span>}
+                </div>
+              </div>
+              <span className="font-mono text-[7px] text-[#aaa] flex-shrink-0">{expandedId === r.id ? '▲' : '▼'}</span>
+            </div>
+            {expandedId === r.id && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: 'auto' }}
+                className="border-t-[2px] border-[#ddd] p-2 bg-[#fafaf5] max-h-60 overflow-y-auto"
+              >
+                <p className="font-mono text-[9px] text-[#555] leading-relaxed whitespace-pre-wrap">{r.content}</p>
+              </motion.div>
+            )}
+          </div>
+        ))}
+      </div>
+    </motion.div>
+  );
+};
+
+// =====================================================================
+// JOBS PIPELINE — shows active/orchestrated tasks
+// =====================================================================
+const JobsPipelinePanel = ({ onClose }) => {
+  const [jobs, setJobs] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [polling, setPolling] = useState(false);
+
+  const fetchJobs = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      // Try Hermes jobs endpoint
+      let res = await fetch('http://localhost:5174/jobs', { signal: AbortSignal.timeout(5000) });
+      if (!res.ok) {
+        // Fallback: try /fs/list for a jobs directory
+        res = await fetch(`${HERMES_BASE}/fs/list?path=/home/falcon/.hermes/jobs`, { signal: AbortSignal.timeout(5000) });
+      }
+      if (res.ok) {
+        let data = await res.json();
+        // If it's a fs/list response, build job cards from files
+        if (data.files) {
+          data = (data.files || []).map(f => ({
+            id: f.name,
+            agent: 'unknown',
+            status: f.type === 'dir' ? 'running' : 'completed',
+            timestamp: f.mtime || Date.now(),
+          }));
+        }
+        setJobs(Array.isArray(data) ? data : []);
+      } else {
+        setJobs([]);
+      }
+    } catch (err) {
+      setError(`Could not reach jobs endpoint: ${err.message}`);
+      setJobs([]);
+    }
+    setLoading(false);
+  };
+
+  useEffect(() => { fetchJobs(); }, []);
+
+  // Auto-poll every 10s
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setPolling(true);
+      fetchJobs().then(() => setPolling(false));
+    }, 10000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const statusColor = (status) => {
+    if (status === 'completed' || status === 'done') return 'text-[#22c55e]';
+    if (status === 'failed') return 'text-[#ef4444]';
+    if (status === 'running' || status === 'pending') return 'text-[#f59e0b]';
+    return 'text-[#888]';
+  };
+
+  const statusDot = (status) => {
+    if (status === 'completed' || status === 'done') return 'bg-[#22c55e]';
+    if (status === 'failed') return 'bg-[#ef4444]';
+    if (status === 'running' || status === 'pending') return 'bg-[#f59e0b] animate-pulse';
+    return 'bg-[#aaa]';
+  };
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 20 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: 20 }}
+      className="border-[3px] border-[#111] bg-white shadow-[6px_6px_0_0_#111] p-4 max-w-md mx-auto max-h-[80vh] flex flex-col"
+    >
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <Cpu size={16} className="text-[#111]" />
+          <span className="font-mono text-[10px] font-black uppercase">Jobs_Pipeline</span>
+          <span className="font-mono text-[8px] text-[#888]">({jobs.length})</span>
+        </div>
+        <div className="flex items-center gap-1">
+          <button onClick={fetchJobs} className="p-1 hover:text-[#22c55e] transition-colors" title="Refresh">
+            <RefreshCw size={12} className={loading ? 'animate-spin' : ''} />
+          </button>
+          <button onClick={onClose} className="p-1 hover:text-[#ef4444] transition-colors"><X size={14} /></button>
+        </div>
+      </div>
+
+      {polling && <p className="font-mono text-[7px] text-[#aaa] text-center mb-2">Auto-refreshing every 10s...</p>}
+
+      <div className="flex-1 overflow-y-auto space-y-2 custom-scrollbar">
+        {loading && jobs.length === 0 && (
+          <div className="flex justify-center py-6">
+            <div className="flex gap-1">
+              <div className="w-2 h-2 bg-[#22c55e] rounded-full animate-bounce [animation-delay:-0.3s]"></div>
+              <div className="w-2 h-2 bg-[#22c55e] rounded-full animate-bounce [animation-delay:-0.15s]"></div>
+              <div className="w-2 h-2 bg-[#22c55e] rounded-full animate-bounce"></div>
+            </div>
+          </div>
+        )}
+        {error && (
+          <div className="p-2 border-[2px] border-[#ef4444] bg-[#fef2f2]">
+            <p className="font-mono text-[9px] text-[#ef4444]">{error}</p>
+            <p className="font-mono text-[8px] text-[#aaa] mt-1">Jobs are tracked by Hermes when agents delegate tasks.</p>
+          </div>
+        )}
+        {!loading && jobs.length === 0 && !error && (
+          <div className="text-center py-8">
+            <Cpu size={32} className="mx-auto text-[#ddd] mb-2" />
+            <p className="font-mono text-[10px] font-black uppercase text-[#aaa]">No Active Jobs</p>
+            <p className="font-mono text-[8px] text-[#ccc] mt-1">When agents delegate tasks, they appear here.</p>
+          </div>
+        )}
+        {jobs.map(job => (
+          <div key={job.id} className="p-3 border-[2px] border-[#ddd] hover:border-[#111] transition-colors">
+            <div className="flex items-start justify-between gap-2">
+              <div className="flex-1 min-w-0">
+                <p className="font-mono text-[10px] font-black uppercase truncate">{job.id}</p>
+                <div className="flex items-center gap-2 mt-0.5">
+                  <span className="font-mono text-[7px] text-[#888]">{job.agent || 'agent'}</span>
+                  {job.timestamp && (
+                    <span className="font-mono text-[7px] text-[#aaa]">{formatRelativeTime(job.timestamp)}</span>
+                  )}
+                </div>
+              </div>
+              <div className="flex flex-col items-end gap-1">
+                <div className="flex items-center gap-1">
+                  <div className={`w-2 h-2 rounded-full ${statusDot(job.status)}`} />
+                  <span className={`font-mono text-[8px] font-black uppercase ${statusColor(job.status)}`}>{job.status}</span>
+                </div>
+                {job.tools_count !== undefined && (
+                  <span className="font-mono text-[7px] text-[#888]">{job.tools_count} tools</span>
+                )}
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </motion.div>
+  );
+};
+
+// =====================================================================
+// MCP SETTINGS — reads ~/.hermes/config.yaml and displays MCP servers
+// =====================================================================
+const MCPSettingsPanel = ({ onClose }) => {
+  const [configText, setConfigText] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [servers, setServers] = useState([]);
+  const [testResults, setTestResults] = useState({});
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [newServer, setNewServer] = useState({ name: '', command: '', env: '' });
+
+  useEffect(() => { loadConfig(); }, []);
+
+  const loadConfig = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const res = await fetch('/fs/read?path=/home/falcon/.hermes/config.yaml', { signal: AbortSignal.timeout(5000) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      setConfigText(text);
+      // Simple YAML parse — extract mcp servers section
+      const mcpMatch = text.match(/mcp:\s*\n([\s\S]*?)(?=\n\w|\n*$)/);
+      const serverBlocks = [];
+      if (mcpMatch) {
+        const lines = mcpMatch[1].split('\n');
+        let current = null;
+        for (const line of lines) {
+          const indent = line.match(/^(\s*)/)[1].length;
+          if (indent === 2 && line.includes(':')) {
+            if (current) serverBlocks.push(current);
+            current = { name: line.trim().replace(':', ''), command: '', env: '' };
+          } else if (current && indent === 4) {
+            if (line.includes('command:')) current.command = line.split('command:')[1].trim();
+            if (line.includes('env:')) current.env = line.split('env:')[1].trim();
+          }
+        }
+        if (current) serverBlocks.push(current);
+      }
+      setServers(serverBlocks);
+    } catch (err) {
+      setError(`Could not load MCP config: ${err.message}`);
+      setServers([]);
+    }
+    setLoading(false);
+  };
+
+  const testConnection = async (serverName) => {
+    setTestResults(prev => ({ ...prev, [serverName]: 'testing' }));
+    try {
+      const res = await fetch('http://localhost:5174/mcp/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ server: serverName }),
+        signal: AbortSignal.timeout(8000),
+      });
+      const ok = res.ok;
+      setTestResults(prev => ({ ...prev, [serverName]: ok ? 'ok' : 'fail' }));
+    } catch {
+      setTestResults(prev => ({ ...prev, [serverName]: 'fail' }));
+    }
+  };
+
+  return (
+    <motion.div
+      initial={{ x: '100%' }}
+      animate={{ x: 0 }}
+      exit={{ x: '100%' }}
+      transition={{ type: 'spring', damping: 25, stiffness: 300 }}
+      className="fixed inset-y-0 right-0 w-full max-w-md bg-[#eae7de] border-l-[4px] border-[#111] z-[200] flex flex-col shadow-[-10px_0_40px_rgba(0,0,0,0.3)]"
+    >
+      <div className="flex items-center justify-between p-4 border-b-[4px] border-[#111] bg-[#111]">
+        <div className="flex items-center gap-3">
+          <Plug size={18} className="text-[#22c55e]" />
+          <span className="font-serif font-black text-xl text-[#eae7de] tracking-tight">MCP_CONFIG</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <button onClick={loadConfig} className="p-2 text-[#e8e8ec]/50 hover:text-[#22c55e] transition-colors">
+            <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
+          </button>
+          <button onClick={onClose} className="p-2 text-[#e8e8ec] hover:text-[#ef4444] transition-colors"><X size={18} /></button>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar">
+        {/* MCP Servers list */}
+        <div>
+          <div className="flex items-center justify-between mb-3">
+            <p className="font-mono text-[9px] font-black uppercase text-[#555]">MCP_SERVERS ({servers.length})</p>
+            <button
+              onClick={() => setShowAddForm(v => !v)}
+              className="flex items-center gap-1 px-3 py-1.5 border-[2px] border-[#111] bg-[#22c55e] text-[#111] font-mono text-[9px] font-black uppercase hover:bg-[#111] hover:text-[#22c55e] transition-colors"
+            ><Plus size={12} /> ADD</button>
+          </div>
+
+          {loading && (
+            <div className="flex justify-center py-4">
+              <div className="flex gap-1">
+                <div className="w-2 h-2 bg-[#22c55e] rounded-full animate-bounce [animation-delay:-0.3s]"></div>
+                <div className="w-2 h-2 bg-[#22c55e] rounded-full animate-bounce [animation-delay:-0.15s]"></div>
+                <div className="w-2 h-2 bg-[#22c55e] rounded-full animate-bounce"></div>
+              </div>
+            </div>
+          )}
+
+          {error && (
+            <div className="p-3 border-[3px] border-[#ef4444] bg-[#fef2f2]">
+              <p className="font-mono text-[10px] text-[#ef4444] font-black uppercase">{error}</p>
+              <p className="font-mono text-[8px] text-[#aaa] mt-1">Place your MCP servers in ~/.hermes/config.yaml under an mcp: key.</p>
+            </div>
+          )}
+
+          {/* Add server form */}
+          {showAddForm && (
+            <div className="p-3 border-[3px] border-[#22c55e] bg-white mb-3 space-y-2">
+              <p className="font-mono text-[9px] font-black uppercase">NEW_SERVER</p>
+              <input
+                type="text"
+                value={newServer.name}
+                onChange={e => setNewServer(p => ({ ...p, name: e.target.value }))}
+                placeholder="Server name"
+                className="w-full bg-[#f5f5f0] border-[2px] border-[#111] px-3 py-2 font-mono text-[10px] focus:outline-none focus:border-[#22c55e]"
+              />
+              <input
+                type="text"
+                value={newServer.command}
+                onChange={e => setNewServer(p => ({ ...p, command: e.target.value }))}
+                placeholder="Command (e.g. npx -y @modelcontextprotocol/server-filesystem)"
+                className="w-full bg-[#f5f5f0] border-[2px] border-[#111] px-3 py-2 font-mono text-[10px] focus:outline-none focus:border-[#22c55e]"
+              />
+              <input
+                type="text"
+                value={newServer.env}
+                onChange={e => setNewServer(p => ({ ...p, env: e.target.value }))}
+                placeholder="Env vars (optional)"
+                className="w-full bg-[#f5f5f0] border-[2px] border-[#111] px-3 py-2 font-mono text-[10px] focus:outline-none focus:border-[#22c55e]"
+              />
+              <div className="flex gap-2">
+                <button
+                  onClick={() => {
+                    if (newServer.name && newServer.command) {
+                      setServers(prev => [...prev, newServer]);
+                      setNewServer({ name: '', command: '', env: '' });
+                      setShowAddForm(false);
+                    }
+                  }}
+                  className="flex-1 px-4 py-2 bg-[#22c55e] text-[#111] border-[2px] border-[#111] font-mono text-[10px] font-black uppercase hover:bg-[#111] hover:text-[#22c55e]"
+                >SAVE</button>
+                <button onClick={() => setShowAddForm(false)} className="flex-1 px-4 py-2 bg-white text-[#ef4444] border-[2px] border-[#ef4444] font-mono text-[10px] font-black uppercase hover:bg-[#ef4444] hover:text-white">CANCEL</button>
+              </div>
+            </div>
+          )}
+
+          {servers.length === 0 && !loading && !error && (
+            <div className="text-center py-6 border-[2px] border-dashed border-[#ddd]">
+              <Plug size={24} className="mx-auto text-[#ddd] mb-2" />
+              <p className="font-mono text-[10px] text-[#aaa] uppercase">No MCP Servers Configured</p>
+              <p className="font-mono text-[8px] text-[#ccc] mt-1">Add servers in ~/.hermes/config.yaml</p>
+            </div>
+          )}
+
+          {servers.map(server => (
+            <div key={server.name} className="p-3 border-[3px] border-[#111] bg-white space-y-2">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Plug size={14} className="text-[#111]" />
+                  <p className="font-sans font-black uppercase text-[11px]">{server.name}</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  {testResults[server.name] === 'ok' && <span className="font-mono text-[8px] text-[#22c55e] font-black uppercase">CONNECTED</span>}
+                  {testResults[server.name] === 'fail' && <span className="font-mono text-[8px] text-[#ef4444] font-black uppercase">FAIL</span>}
+                  <button
+                    onClick={() => testConnection(server.name)}
+                    className="px-2 py-1 bg-[#111] text-[#22c55e] border-[2px] border-[#111] font-mono text-[8px] font-black uppercase hover:bg-[#222] transition-colors"
+                    disabled={testResults[server.name] === 'testing'}
+                  >
+                    {testResults[server.name] === 'testing' ? '...' : 'TEST'}
+                  </button>
+                </div>
+              </div>
+              <div className="grid grid-cols-1 gap-1">
+                <div className="flex items-start gap-2">
+                  <span className="font-mono text-[7px] text-[#888] uppercase w-12 flex-shrink-0">CMD</span>
+                  <span className="font-mono text-[8px] text-[#555] break-all">{server.command}</span>
+                </div>
+                {server.env && (
+                  <div className="flex items-start gap-2">
+                    <span className="font-mono text-[7px] text-[#888] uppercase w-12 flex-shrink-0">ENV</span>
+                    <span className="font-mono text-[8px] text-[#555] break-all">{server.env}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Raw config */}
+        {configText && (
+          <div>
+            <p className="font-mono text-[9px] font-black uppercase text-[#555] mb-2">RAW_CONFIG</p>
+            <pre className="font-mono text-[8px] text-[#666] whitespace-pre-wrap bg-white border-[3px] border-[#111] p-3 max-h-60 overflow-y-auto">{configText}</pre>
+          </div>
+        )}
+      </div>
+    </motion.div>
+  );
+};
+
+// =====================================================================
 // PWA INSTALL BANNER (additive)
 // =====================================================================
 const PWAInstallBanner = ({ onInstall, onDismiss }) => (
@@ -801,38 +1456,163 @@ const KnowledgeVaultPanel = ({ onClose }) => {
 };
 
 // =====================================================================
-// SKILLS MODULE PANEL (additive — was a placeholder click target)
+// SKILLS HUB — reads skill files from Hermes ~/.hermes/skills directory
+// Replaces SkillsModulePanel stub
 // =====================================================================
-const SkillsModulePanel = ({ onClose }) => {
-  const skills = [
-    { id: 'web-search', name: 'WEB_SEARCH', desc: 'Search the internet for current information', status: 'ready' },
-    { id: 'code-run', name: 'CODE_RUNNER', desc: 'Execute Python or JavaScript code', status: 'ready' },
-    { id: 'file-ops', name: 'FILE_OPS', desc: 'Read, write, and manage files', status: 'ready' },
-    { id: 'scrape', name: 'WEB_SCRAPE', desc: 'Extract data from websites', status: 'ready' },
-  ];
+const SkillsHubPanel = ({ onClose }) => {
+  const [skills, setSkills] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [search, setSearch] = useState('');
+  const [expandedId, setExpandedId] = useState(null);
+  const [categoryFilter, setCategoryFilter] = useState('all');
+
+  useEffect(() => {
+    loadSkills();
+  }, []);
+
+  const loadSkills = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const res = await fetch(`${HERMES_BASE}/fs/list?path=/home/falcon/.hermes/skills`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const dirs = (data.files || []).filter(f => f.type === 'dir');
+
+      const skillData = await Promise.all(
+        dirs.map(async (dir) => {
+          try {
+            const mdRes = await fetch(`/fs/read?path=/home/falcon/.hermes/skills/${dir.name}/SKILL.md`);
+            if (!mdRes.ok) return { id: dir.name, name: dir.name.replace(/-/g, '_').toUpperCase(), description: 'No description', category: 'general', status: 'ready', raw: '' };
+            const mdText = await mdRes.text();
+            const nameMatch = mdText.match(/^name:\s*(.+)$/m);
+            const descMatch = mdText.match(/^description:\s*(.+)$/m);
+            const catMatch = mdText.match(/^category:\s*(.+)$/m);
+            return {
+              id: dir.name,
+              name: nameMatch ? nameMatch[1].trim() : dir.name.replace(/-/g, '_').toUpperCase(),
+              description: descMatch ? descMatch[1].trim() : 'No description',
+              category: catMatch ? catMatch[1].trim().toLowerCase() : 'general',
+              status: 'ready',
+              raw: mdText,
+            };
+          } catch {
+            return { id: dir.name, name: dir.name.replace(/-/g, '_').toUpperCase(), description: 'Error loading', category: 'general', status: 'error', raw: '' };
+          }
+        })
+      );
+      setSkills(skillData);
+    } catch (err) {
+      setError(`Failed to load skills: ${err.message}`);
+      setSkills([]);
+    }
+    setLoading(false);
+  };
+
+  const categories = ['all', ...new Set(skills.map(s => s.category))];
+  const filtered = skills.filter(s => {
+    const matchSearch = !search || s.name.toLowerCase().includes(search.toLowerCase()) || s.description.toLowerCase().includes(search.toLowerCase());
+    const matchCat = categoryFilter === 'all' || s.category === categoryFilter;
+    return matchSearch && matchCat;
+  });
 
   return (
     <motion.div
       initial={{ opacity: 0, y: 20 }}
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0, y: 20 }}
-      className="border-[3px] border-[#111] bg-white shadow-[6px_6px_0_0_#111] p-4 max-w-md mx-auto"
+      className="border-[3px] border-[#111] bg-white shadow-[6px_6px_0_0_#111] p-4 max-w-md mx-auto max-h-[80vh] flex flex-col"
     >
-      <div className="flex items-center justify-between mb-4">
+      {/* Header */}
+      <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-2">
           <Zap size={16} className="text-[#111]" />
-          <span className="font-mono text-[10px] font-black uppercase">Skills_Module</span>
+          <span className="font-mono text-[10px] font-black uppercase">Skills_Hub</span>
+          <span className="font-mono text-[8px] text-[#888]">({skills.length})</span>
         </div>
-        <button onClick={onClose} className="p-1 hover:text-[#22c55e] transition-colors"><X size={14} /></button>
+        <div className="flex items-center gap-1">
+          <button onClick={loadSkills} className="p-1 hover:text-[#22c55e] transition-colors" title="Refresh">
+            <RefreshCw size={12} className={loading ? 'animate-spin' : ''} />
+          </button>
+          <button onClick={onClose} className="p-1 hover:text-[#ef4444] transition-colors"><X size={14} /></button>
+        </div>
       </div>
-      <div className="space-y-2">
-        {skills.map(skill => (
-          <div key={skill.id} className="flex items-center justify-between p-2 border-[2px] border-[#ddd] hover:border-[#111] transition-colors">
-            <div>
-              <p className="font-mono text-[10px] font-black uppercase">{skill.name}</p>
-              <p className="font-mono text-[8px] text-[#666]">{skill.desc}</p>
+
+      {/* Search */}
+      <input
+        type="text"
+        value={search}
+        onChange={e => setSearch(e.target.value)}
+        placeholder="Search skills..."
+        className="w-full bg-[#f5f5f0] border-[2px] border-[#111] px-3 py-2 font-mono text-[10px] mb-2 focus:outline-none focus:border-[#22c55e]"
+      />
+
+      {/* Category filter */}
+      <div className="flex gap-1 flex-wrap mb-3">
+        {categories.map(cat => (
+          <button
+            key={cat}
+            onClick={() => setCategoryFilter(cat)}
+            className={`px-2 py-1 font-mono text-[7px] font-black uppercase border-[2px] border-[#111] transition-colors ${categoryFilter === cat ? 'bg-[#111] text-[#22c55e]' : 'bg-white text-[#111] hover:bg-[#f5f5f0]'}`}
+          >
+            {cat}
+          </button>
+        ))}
+      </div>
+
+      {/* Skills grid */}
+      <div className="flex-1 overflow-y-auto space-y-2 custom-scrollbar">
+        {loading && skills.length === 0 && (
+          <div className="flex justify-center py-6">
+            <div className="flex gap-1">
+              <div className="w-2 h-2 bg-[#22c55e] rounded-full animate-bounce [animation-delay:-0.3s]"></div>
+              <div className="w-2 h-2 bg-[#22c55e] rounded-full animate-bounce [animation-delay:-0.15s]"></div>
+              <div className="w-2 h-2 bg-[#22c55e] rounded-full animate-bounce"></div>
             </div>
-            <div className={`w-2 h-2 rounded-full ${skill.status === 'ready' ? 'bg-[#22c55e] shadow-[0_0_8px_#22c55e]' : 'bg-[#ef4444]'}`} />
+          </div>
+        )}
+        {error && (
+          <div className="p-2 border-[2px] border-[#ef4444] bg-[#fef2f2]">
+            <p className="font-mono text-[9px] text-[#ef4444]">{error}</p>
+          </div>
+        )}
+        {!loading && filtered.length === 0 && !error && (
+          <p className="font-mono text-[9px] text-[#999] text-center py-4">No skills match your search.</p>
+        )}
+        {filtered.map(skill => (
+          <div key={skill.id} className="border-[2px] border-[#ddd] hover:border-[#111] transition-all">
+            <div
+              onClick={() => setExpandedId(expandedId === skill.id ? null : skill.id)}
+              className="flex items-start gap-2 p-2 cursor-pointer"
+            >
+              <div className={`w-2 h-2 rounded-full mt-1 flex-shrink-0 ${skill.status === 'ready' ? 'bg-[#22c55e] shadow-[0_0_6px_#22c55e]' : 'bg-[#ef4444]'}`} />
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <p className="font-mono text-[10px] font-black uppercase truncate">{skill.name}</p>
+                  {skill.category !== 'general' && (
+                    <span className="font-mono text-[7px] bg-[#f5f5f0] px-1.5 py-0.5 border border-[#ddd] text-[#888] flex-shrink-0">{skill.category}</span>
+                  )}
+                </div>
+                <p className="font-mono text-[8px] text-[#666] mt-0.5 truncate">{skill.description}</p>
+              </div>
+              <span className="font-mono text-[7px] text-[#aaa] flex-shrink-0">{expandedId === skill.id ? '▲' : '▼'}</span>
+            </div>
+            {expandedId === skill.id && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: 'auto' }}
+                className="border-t-[2px] border-[#ddd] p-2 bg-[#fafaf5]"
+              >
+                <p className="font-mono text-[8px] text-[#555] leading-relaxed whitespace-pre-wrap">{skill.description}</p>
+                {skill.raw && (
+                  <details className="mt-2">
+                    <summary className="font-mono text-[7px] text-[#888] cursor-pointer hover:text-[#111]">SHOW SKILL FILE</summary>
+                    <pre className="mt-1 font-mono text-[8px] text-[#666] whitespace-pre-wrap bg-[#f5f5f0] p-2 border border-[#ddd] max-h-40 overflow-y-auto">{skill.raw}</pre>
+                  </details>
+                )}
+              </motion.div>
+            )}
           </div>
         ))}
       </div>
@@ -1149,12 +1929,12 @@ const PreviewPanel = ({ content, filePath, onClose }) => {
         .catch(e => { setError(`Failed to fetch: ${e.message}`); setLoading(false); });
     } else {
       // Read local file via API
-      fetch(`http://localhost:5174/fs/read?path=${encodeURIComponent(filePath)}`)
+      fetch(`/fs/read?path=${encodeURIComponent(filePath)}`)
         .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.text(); })
         .then(t => { setFileContent(t); setLoading(false); })
         .catch(() => {
           // Fallback: try the local file server
-          fetch(`http://localhost:5175/fs/read?path=${encodeURIComponent(filePath)}`)
+          fetch(`${LOCAL_API_BASE}/fs/read?path=${encodeURIComponent(filePath)}`)
             .then(r2 => { if (!r2.ok) throw new Error(`HTTP ${r2.status}`); return r2.text(); })
             .then(t2 => { setFileContent(t2); setLoading(false); })
             .catch(e2 => { setError(`Could not read file. Path: ${filePath}`); setLoading(false); });
@@ -1222,10 +2002,9 @@ const FileTree = ({ rootPath, onFileSelect, selectedFile, onRefresh }) => {
     setLoading(true);
     try {
       // Try port 5174 first
-      let res = await fetch(`http://localhost:5174/fs/list?path=${encodeURIComponent(path)}`);
+      let res = await fetch(`${HERMES_BASE}/fs/list?path=${encodeURIComponent(path)}`);
       if (!res.ok) {
-        // Fallback to 5175
-        res = await fetch(`http://localhost:5175/fs/list?path=${encodeURIComponent(path)}`);
+        res = await fetch(`${LOCAL_API_BASE}/fs/list?path=${encodeURIComponent(path)}`);
       }
       if (res.ok) {
         const data = await res.json();
@@ -1703,6 +2482,11 @@ export default function App() {
   const [showPathInput, setShowPathInput] = useState(false);
   const [pathInputValue, setPathInputValue] = useState('');
 
+  // --- Offline support ---
+  const [queuedCount, setQueuedCount] = useState(() => getQueue().length);
+  const { isOnline, isHermesConnected, queueCount } = useOffline();
+  const { flushQueue } = useHermesApi();
+
   // --- Projects ---
   const [projects, setProjects] = useState(() => {
     try { return JSON.parse(localStorage.getItem('80m-projects')) || []; } catch { return []; }
@@ -1742,76 +2526,13 @@ export default function App() {
   };
   const [showMemory, setShowMemory] = useState(false);
   const [showWebhook, setShowWebhook] = useState(false);
+  const [showJobs, setShowJobs] = useState(false);
+  const [showMCP, setShowMCP] = useState(false);
 
   const scrollRef = useRef(null);
 
-  // --- New: Conversations (real CRUD) ---
-  const [conversations, setConversations] = useState(() => {
-    try {
-      const saved = localStorage.getItem('80m-agent-conversations');
-      return saved ? JSON.parse(saved) : [
-        { id: 'default', title: 'New Conversation', messages: loadMessages(), createdAt: Date.now(), updatedAt: Date.now() },
-      ];
-    } catch {
-      return [
-        { id: 'default', title: 'New Conversation', messages: loadMessages(), createdAt: Date.now(), updatedAt: Date.now() },
-      ];
-    }
-  });
-  const [activeConversationId, setActiveConversationId] = useState('default');
-
-  // Derived: current conversation's messages
-  const currentConversation = conversations.find(c => c.id === activeConversationId) || conversations[0];
-  const [messages, setMessages] = useState(() => currentConversation?.messages || loadMessages());
+  const [messages, setMessages] = useState(() => loadMessages());
   const [inputValue, setInputValue] = useState('');
-
-  // Sync messages to conversation whenever they change
-  useEffect(() => {
-    setConversations(prev => prev.map(c =>
-      c.id === activeConversationId
-        ? { ...c, messages, updatedAt: Date.now() }
-        : c
-    ));
-  }, [messages]);
-
-  // Persist conversations
-  useEffect(() => {
-    localStorage.setItem('80m-agent-conversations', JSON.stringify(conversations));
-  }, [conversations]);
-
-  // --- New: Conversation CRUD helpers ---
-  const createConversation = () => {
-    const id = `conv_${Date.now()}`;
-    const newConv = { id, title: 'New Conversation', messages: [], createdAt: Date.now(), updatedAt: Date.now() };
-    setConversations(prev => [newConv, ...prev]);
-    setActiveConversationId(id);
-    setMessages([]);
-    setViewMode('session');
-  };
-
-  const loadConversation = (id) => {
-    const conv = conversations.find(c => c.id === id);
-    if (!conv) return;
-    setActiveConversationId(id);
-    setMessages(conv.messages);
-    setViewMode('session');
-  };
-
-  const renameConversation = (id, title) => {
-    setConversations(prev => prev.map(c => c.id === id ? { ...c, title, updatedAt: Date.now() } : c));
-  };
-
-  const deleteConversation = (id) => {
-    if (conversations.length <= 1) return;
-    setConversations(prev => {
-      const remaining = prev.filter(c => c.id !== id);
-      if (activeConversationId === id) {
-        setActiveConversationId(remaining[0]?.id);
-        setMessages(remaining[0]?.messages || []);
-      }
-      return remaining;
-    });
-  };
 
   // --- New: Build agents from config ---
   const employees = config.agents.map(a => ({
@@ -1823,7 +2544,8 @@ export default function App() {
 
   // --- Original: Core State ---
   const [agentState, setAgentState] = useState('default');
-  const [activeEmployee, setActiveEmployee] = useState(config.agents[0]?.id || 'Hermes');
+  const [agentThinking, setAgentThinking] = useState(false);
+  const [activeEmployee, setActiveEmployee] = useState(config.agents[0]?.id || 'prawnius');
   const [loadPhase, setLoadPhase] = useState('logo');
   const [viewMode, setViewMode] = useState('session'); // 'session' or 'history'
 
@@ -1842,6 +2564,15 @@ export default function App() {
     events.forEach(e => document.addEventListener(e, handle));
     return () => events.forEach(e => document.removeEventListener(e, handle));
   }, [unlock]);
+
+  // --- New: Process offline queue when Hermes reconnects ---
+  useEffect(() => {
+    if (isHermesConnected) {
+      const queue = getQueue();
+      setQueuedCount(queue.length);
+      if (queue.length > 0) flushQueue();
+    }
+  }, [isHermesConnected, flushQueue]);
 
   // Play agent chime when a new assistant message arrives
   const prevMessagesLenRef = useRef(messages.length);
@@ -1937,7 +2668,7 @@ export default function App() {
     fetch(config.apiEndpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: 'ping', stream: false }),
+      body: JSON.stringify({ message: 'ping', agent_id: activeEmployee }),
       signal: AbortSignal.timeout(5000),
     })
       .then(() => setConnectionStatus('connected'))
@@ -2062,105 +2793,90 @@ export default function App() {
 
     // If API is enabled, make a real request
     if (config.apiEnabled && config.apiEndpoint) {
+      // --- Offline-aware: queue if Hermes is unreachable ---
+      if (!isHermesConnected || !isOnline) {
+        const queuedId = queueMessage({ text: displayMsg, agent: activeEmployee });
+        const assistantMsgId = Date.now() + 1;
+        setMessages(prev => [...prev, {
+          id: assistantMsgId,
+          role: 'assistant',
+          employee: activeEmployee,
+          content: `[Message queued — will send when Hermes reconnects. Queue: ${queueCount + 1}]`,
+        }]);
+        setQueuedCount(q => q + 1);
+        return;
+      }
+
       setAgentState('processing');
-
+      setAgentThinking(true);
       const assistantMsgId = Date.now() + 1;
-      let fullResponse = '';
-      let toolEvents = [];
+      setToolEventsByMsg(prev => ({ ...prev, [assistantMsgId]: [] }));
 
-      // Add placeholder assistant message (empty, we'll stream into it)
+      // Add placeholder assistant message (empty, we'll fill it when the job completes)
       setMessages(prev => [...prev, { id: assistantMsgId, role: 'assistant', employee: activeEmployee, content: '' }]);
 
       try {
-        // Build context block for the API
         const contextBlock = contextVars.length > 0
           ? `\n[PROJECT CONTEXT — ${projectNamespace || 'global'}]\n${contextVars.map(v => `${v.key}: ${v.value}`).join('\n')}\n[/CONTEXT]\n`
           : '';
         const fullMessage = contextBlock + inputValue;
 
-        const res = await fetch(config.apiEndpoint, {
+        const submitRes = await fetch(config.apiEndpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: fullMessage, agent: activeEmployee, stream: true, namespace: projectNamespace, context: contextVars }),
-          signal: AbortSignal.timeout(300000),
+          body: JSON.stringify({ message: fullMessage, agent_id: activeEmployee }),
+          signal: AbortSignal.timeout(30000),
         });
 
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!submitRes.ok) throw new Error(`HTTP ${submitRes.status}`);
+        const submitData = await submitRes.json();
+        const jobId = submitData.job_id;
+        if (!jobId) throw new Error('Missing job_id from Hermes backend');
 
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
+        let completed = false;
+        for (let i = 0; i < 300; i++) {
+          await new Promise(r => setTimeout(r, 1000));
+          const statusRes = await fetch(`${HERMES_BASE}/chat/status/${jobId}`, {
+            signal: AbortSignal.timeout(10000),
+          });
+          if (!statusRes.ok) continue;
+          const statusData = await statusRes.json();
 
-        setAgentState('typing');
+          if (statusData.status === 'queued' || statusData.status === 'running') {
+            setAgentState('typing');
+            continue;
+          }
 
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
+          if (statusData.status === 'completed') {
+            // Hermes returns { response: "...", events: [...] }
+            const responseText = statusData.response || statusData.result?.response || '';
+            const events = statusData.events || statusData.result?.events || [];
+            setToolEventsByMsg(prev => ({ ...prev, [assistantMsgId]: events.filter(e => e.type === 'tool') }));
+            setMessages(prev => prev.map(m => m.id === assistantMsgId ? { ...m, content: responseText || '[No response returned]' } : m));
+            completed = true;
+            break;
+          }
 
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-
-          for (const line of lines) {
-            if (!line.startsWith('data: ')) continue;
-            const raw = line.slice(6);
-            if (!raw.trim()) continue;
-
-            try {
-              const event = JSON.parse(raw);
-
-              if (event.type === 'tool') {
-                // Real-time tool display — animate mascot based on tool
-                toolEvents.push(event);
-                setToolEventsByMsg(prev => ({
-                  ...prev,
-                  [assistantMsgId]: [...(prev[assistantMsgId] || []), event]
-                }));
-                if (event.tool === 'websearch' || event.tool === 'search') {
-                  setAgentState('searching');
-                } else if (event.tool === 'code' || event.tool === 'code_exec') {
-                  setAgentState('typing');
-                }
-              }
-
-              if (event.type === 'thinking' || event.type === 'context') {
-                // Show thinking inline — append as a system note
-                setMessages(prev => {
-                  const last = prev[prev.length - 1];
-                  if (last && last.id === assistantMsgId && last.content.startsWith('[thinking]')) {
-                    return prev.map(m => m.id === assistantMsgId ? { ...m, content: m.content + event.text } : m);
-                  } else if (event.text) {
-                    return [...prev, { id: Date.now(), role: 'system', content: `[thinking] ${event.text}` }];
-                  }
-                  return prev;
-                });
-              }
-
-              if (event.type === 'chunk' || event.type === 'token' || event.type === 'delta') {
-                fullResponse += event.text || event.content || '';
-                setMessages(prev => prev.map(m => m.id === assistantMsgId ? { ...m, content: fullResponse } : m));
-              }
-
-              if (event.type === 'done' || event.type === 'ended') {
-                fullResponse = event.response || fullResponse;
-              }
-            } catch {
-              // Not JSON — treat as raw text chunk
-              fullResponse += raw;
-              setMessages(prev => prev.map(m => m.id === assistantMsgId ? { ...m, content: fullResponse } : m));
-            }
+          if (statusData.status === 'failed') {
+            throw new Error(statusData.result?.error || statusData.error || 'Hermes job failed');
           }
         }
 
-        setAgentState('job-done');
-        setTimeout(() => setAgentState('default'), 2000);
+        if (!completed) throw new Error('Hermes job timeout');
 
+        setAgentState('job-done');
+        setTimeout(() => setAgentState('default'), 1500);
       } catch (err) {
-        setAgentState('error');
-        setTimeout(() => {
-          setMessages(prev => prev.map(m => m.id === assistantMsgId ? { ...m, content: `CONNECTION_ERROR: ${err.message}. Check your endpoint config in Settings.` } : m));
-          setAgentState('default');
-        }, 2000);
+        // On error, queue the message for retry instead of showing error
+        const queuedId = queueMessage({ text: displayMsg, agent: activeEmployee });
+        setMessages(prev => prev.map(m => m.id === assistantMsgId ? {
+          ...m,
+          content: `[Connection lost — message queued. Will retry when Hermes reconnects.]`,
+        } : m));
+        setQueuedCount(q => q + 1);
+        setAgentState('default');
+      } finally {
+        setAgentThinking(false);
       }
     } else {
       // Demo mode — original animated simulation
@@ -2185,11 +2901,34 @@ export default function App() {
   // ==================================================================
   // ORIGINAL UI — exactly as provided, with new features overlayed
   // ==================================================================
+
+  // --- OfflineStatusBar: shown when offline or Hermes is down ---
+  const OfflineStatusBar = () => {
+    if (isOnline && isHermesConnected) return null;
+    return (
+      <div className="fixed top-0 left-0 right-0 z-[100] flex items-center justify-center gap-2 px-4 py-2 bg-[#111] text-[#22c55e] font-mono text-[10px] font-black uppercase">
+        {!isOnline ? (
+          <><WifiOff size={12} /> OFFLINE — Messages will queue until reconnected</>
+        ) : (
+          <><Activity size={12} /> HERMES OFFLINE — Messages will queue ({queuedCount} pending)</>
+        )}
+      </div>
+    );
+  };
+
+  // --- Shared content handler (PWA share target) ---
+  const handleShared = (data) => {
+    if (data.text) setInputValue(prev => prev ? `${prev} ${data.text}` : data.text);
+    if (data.url) setInputValue(prev => prev ? `${prev} ${data.url}` : data.url);
+  };
+
   return (
     <div className="h-screen w-full text-[#111] font-sans flex items-center justify-center overflow-hidden selection:bg-[#111] selection:text-[#eae7de] relative">
       <NoiseOverlay />
       <PaperBackground />
       <ParticleFieldCanvas />
+      <OfflineStatusBar />
+      <ShareHandler onShared={handleShared} />
 
       <AnimatePresence>
         {loadPhase === 'logo' && (
@@ -2246,7 +2985,7 @@ export default function App() {
                 {/* 3 Tab buttons - Session / History / Agents */}
                 {/* 3 Tab buttons - Session / History / Agents */}
                 <div className="space-y-1">
-                  <div className="grid grid-cols-4 gap-1 bg-[#2a2a2e]/60 backdrop-blur-md border border-[#3a3a3e] p-1">
+                  <div className="grid grid-cols-3 gap-1 bg-[#2a2a2e]/60 backdrop-blur-md border border-[#3a3a3e] p-1">
                   <button
                     onClick={() => setViewMode('session')}
                     className={`flex items-center justify-center gap-1 p-2 rounded-lg transition-all ${viewMode === 'session' ? 'bg-[#22c55e]/20 text-[#22c55e] border border-[#22c55e]/40 shadow-[0_0_12px_rgba(34,197,94,0.15)]' : 'text-[#e8e8ec]/40 hover:text-[#e8e8ec]/70'}`}
@@ -2254,13 +2993,7 @@ export default function App() {
                     <Activity size={16} strokeWidth={3} />
                     <span className="hidden lg:block font-sans font-black uppercase text-[9px] tracking-tight">Session</span>
                   </button>
-                  <button
-                    onClick={() => setViewMode('history')}
-                    className={`flex items-center justify-center gap-1 p-2 rounded-lg transition-all ${viewMode === 'history' ? 'bg-[#22c55e]/20 text-[#22c55e] border border-[#22c55e]/40 shadow-[0_0_12px_rgba(34,197,94,0.15)]' : 'text-[#e8e8ec]/40 hover:text-[#e8e8ec]/70'}`}
-                  >
-                    <Clock size={16} strokeWidth={3} />
-                    <span className="hidden lg:block font-sans font-black uppercase text-[9px] tracking-tight">History</span>
-                  </button>
+                  
                   <button
                     onClick={() => setViewMode('projects')}
                     className={`flex items-center justify-center gap-1 p-2 rounded-lg transition-all ${viewMode === 'projects' ? 'bg-[#22c55e]/20 text-[#22c55e] border border-[#22c55e]/40 shadow-[0_0_12px_rgba(34,197,94,0.15)]' : 'text-[#e8e8ec]/40 hover:text-[#e8e8ec]/70'}`}
@@ -2305,31 +3038,17 @@ export default function App() {
                         <Globe size={18} className="text-[#111]" onClick={() => setShowWebhook(v => !v)} />
                         <span className="hidden lg:block font-sans font-black uppercase text-[11px] tracking-tight opacity-40 group-hover:opacity-100">Webhooks</span>
                       </div>
-                    </motion.div>
-                  )}
-                  {viewMode === 'history' && (
-                    <motion.div 
-                      key="history-list"
-                      initial={{ opacity: 0, x: 10 }}
-                      animate={{ opacity: 1, x: 0 }}
-                      exit={{ opacity: 0, x: 10 }}
-                      className="space-y-2 pt-4"
-                    >
-                      <div className="flex items-center justify-between px-2">
-                        <p className="hidden lg:block font-mono text-[8px] font-black uppercase text-[#555]">Past_Sequences</p>
-                        <button onClick={createConversation} className="p-1 hover:text-[#22c55e]"><Plus size={14} /></button>
+                      <div className="flex items-center gap-3 p-3 hover:bg-black/5 transition-colors cursor-pointer group border-[3px] border-transparent hover:border-[#111]">
+                        <Cpu size={18} className="text-[#111]" onClick={() => setShowJobs(v => !v)} />
+                        <span className="hidden lg:block font-sans font-black uppercase text-[11px] tracking-tight opacity-40 group-hover:opacity-100">Jobs_Pipeline</span>
                       </div>
-                      {conversations.map(chat => (
-                        <div key={chat.id} onClick={() => loadConversation(chat.id)} className="flex items-center gap-3 p-3 hover:bg-[#111] hover:text-[#eae7de] transition-all cursor-pointer group border-[3px] border-[#111]/10 hover:border-[#111] shadow-[0_0_0_0_rgba(0,0,0,1)] hover:shadow-[4px_4px_0_0_rgba(0,0,0,1)]">
-                          <MessageSquare size={16} />
-                          <div className="hidden lg:block overflow-hidden">
-                            <p className="font-sans font-black uppercase text-[10px] truncate">{chat.title}</p>
-                            <p className="font-mono text-[7px] uppercase opacity-40">{formatRelativeTime(chat.updatedAt)}</p>
-                          </div>
-                        </div>
-                      ))}
+                      <div className="flex items-center gap-3 p-3 hover:bg-black/5 transition-colors cursor-pointer group border-[3px] border-transparent hover:border-[#111]">
+                        <Plug size={18} className="text-[#111]" onClick={() => setShowMCP(v => !v)} />
+                        <span className="hidden lg:block font-sans font-black uppercase text-[11px] tracking-tight opacity-40 group-hover:opacity-100">MCP_Settings</span>
+                      </div>
                     </motion.div>
                   )}
+                  
                   {viewMode === 'agents' && (
                     <motion.div
                       key="agents-list"
@@ -2603,9 +3322,9 @@ export default function App() {
                 {/* Messages list — scrollable when split view is on */}
                 <div className={`${splitView ? 'flex-1 overflow-y-auto p-2 lg:p-4 space-y-2 scroll-smooth custom-scrollbar' : 'flex-1'}`}>
               <AnimatePresence initial={false}>
-                {messages.map((msg) => (
+                {messages.filter(msg => msg.role !== 'assistant' || msg.content || (toolEventsByMsg[msg.id] && toolEventsByMsg[msg.id].length > 0) || agentThinking).map((msg, index, filteredArr) => (
                   <motion.div
-                    key={msg.id}
+                    key={msg.id + '-' + index}
                     initial={{ opacity: 0, y: 16, scale: 0.96 }}
                     animate={{ opacity: 1, y: 0, scale: 1 }}
                     transition={{ type: 'spring', stiffness: 380, damping: 30 }}
@@ -2638,14 +3357,18 @@ export default function App() {
                     )}
                     <div className={`max-w-[95%] lg:max-w-[80%] p-4 border-[2px] border-[#3a3a3e] shadow-[0_8px_32px_rgba(0,0,0,0.4)] ${msg.role === 'user' ? 'bg-[#e8e8ec]/85 text-[#111] rounded-[22px]' : 'bg-[#2a2a2e]/85 text-[#e8e8ec] backdrop-blur-sm relative'}`}>
                       {msg.role === 'assistant' && (
-                        <div className="absolute -top-4 -left-4 -rotate-12 group">
+                        <div className="absolute -top-4 -left-4 -rotate-12 group z-50 cursor-help">
                           <Bot size={18} strokeWidth={2} className="text-[#22c55e] drop-shadow-[0_2px_8px_rgba(34,197,94,0.4)]" />
-                          <div className="absolute bottom-full left-0 mb-1 px-2 py-1 bg-[#1c1c1e] border border-[#3a3a3e] shadow-[2px_2px_0_0_#22c55e]/30 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-50">
+                          <div className="absolute bottom-full left-0 mb-2 px-2 py-1 bg-[#1c1c1e] border-[2px] border-[#3a3a3e] shadow-[2px_2px_0_0_#22c55e] opacity-0 group-hover:opacity-100 transition-all transform translate-y-2 group-hover:translate-y-0 whitespace-nowrap z-[100] pointer-events-none">
                             <p className="font-mono text-[8px] font-black uppercase text-[#22c55e]">{msg.employee}_V4</p>
                           </div>
                         </div>
                       )}
-                      <p className="font-mono text-base lg:text-lg leading-relaxed whitespace-pre-wrap tracking-tight">{msg.content}</p>
+                      {msg.content ? (
+                        <p className="font-mono text-base lg:text-lg leading-relaxed whitespace-pre-wrap tracking-tight">{msg.content}</p>
+                      ) : agentThinking && index === filteredArr.length - 1 ? (
+                        <div className="flex items-center gap-2 text-[#888] py-2"><Activity size={14} className="animate-pulse" /> <span className="font-mono text-[10px] uppercase tracking-widest">Processing...</span></div>
+                      ) : null}
                     </div>
                     {msg.role === 'assistant' && (
                       <div className="flex items-center gap-2 font-mono text-[9px] font-black uppercase tracking-[0.2em] text-[#22c55e] mt-0.5">
@@ -2767,18 +3490,32 @@ export default function App() {
         </AnimatePresence>
 
         <AnimatePresence>
-          {showVault && (
+          {showSkills && (
             <div className="fixed bottom-0 left-0 right-0 z-[150] p-3 bg-[#eae7de] border-t-[4px] border-[#111]">
-              <KnowledgeVaultPanel onClose={() => setShowVault(false)} />
+              <SkillsHubPanel onClose={() => setShowSkills(false)} />
             </div>
           )}
         </AnimatePresence>
 
         <AnimatePresence>
-          {showSkills && (
+          {showVault && (
             <div className="fixed bottom-0 left-0 right-0 z-[150] p-3 bg-[#eae7de] border-t-[4px] border-[#111]">
-              <SkillsModulePanel onClose={() => setShowSkills(false)} />
+              <MemoryBrowserPanel onClose={() => setShowVault(false)} />
             </div>
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {showJobs && (
+            <div className="fixed bottom-0 left-0 right-0 z-[150] p-3 bg-[#eae7de] border-t-[4px] border-[#111]">
+              <JobsPipelinePanel onClose={() => setShowJobs(false)} />
+            </div>
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {showMCP && (
+            <MCPSettingsPanel onClose={() => setShowMCP(false)} />
           )}
         </AnimatePresence>
 
