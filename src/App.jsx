@@ -3045,6 +3045,9 @@ export default function App() {
   const recordingRef = useRef(false);
   const recognitionRef = useRef(null);
   const mascotTimerRef = useRef(null);
+  const [voiceError, setVoiceError] = useState('');
+  const [ttsEnabled, setTtsEnabled] = useState(true);
+  const spokenMessageIdsRef = useRef(new Set());
 
   // --- New: Audio feedback (Web Audio API) ---
   const { unlock, playSendClick, playAgentChime } = useAudio();
@@ -3086,12 +3089,49 @@ export default function App() {
     prevMessagesLenRef.current = messages.length;
   }, [messages, playAgentChime]);
 
+  // --- Browser-native natural TTS for assistant replies ---
+  const speakText = useCallback((text) => {
+    if (!text || !window.speechSynthesis) return;
+    const utterance = new SpeechSynthesisUtterance(text);
+    const voices = window.speechSynthesis.getVoices();
+    const naturalVoice = voices.find(v =>
+      /en-US/i.test(v.lang) && /(natural|neural|samantha|google us english|aria|jenny|zira)/i.test(v.name)
+    ) || voices.find(v => /en-US/i.test(v.lang)) || voices[0];
+    if (naturalVoice) utterance.voice = naturalVoice;
+    utterance.rate = 1;
+    utterance.pitch = 1;
+    utterance.volume = 1;
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(utterance);
+  }, []);
+
+  useEffect(() => {
+    const last = messages[messages.length - 1];
+    if (!ttsEnabled || !last || last.role !== 'assistant' || spokenMessageIdsRef.current.has(last.id)) return;
+    spokenMessageIdsRef.current.add(last.id);
+    const spokenText = String(last.content || '')
+      .replace(/```[\s\S]*?```/g, ' code block omitted ')
+      .replace(/[#>*_`~-]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (spokenText) speakText(spokenText);
+  }, [messages, speakText, ttsEnabled]);
+
+  useEffect(() => () => {
+    window.speechSynthesis?.cancel();
+  }, []);
+
   // --- Voice input: start recording ---
   const startRecording = useCallback(() => {
     if (recordingRef.current) return;
     try {
+      window.speechSynthesis?.cancel();
       const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (!SpeechRecognition) return;
+      if (!SpeechRecognition) {
+        setVoiceError('Voice input is not supported in this browser.');
+        return;
+      }
+      setVoiceError('');
 
       const recognition = new SpeechRecognition();
       recognition.continuous = true;
@@ -3114,6 +3154,9 @@ export default function App() {
       };
 
       recognition.onerror = (event) => {
+        if (event.error === 'not-allowed' || event.error === 'permission-denied') {
+          setVoiceError('Microphone permission denied. Please allow mic access.');
+        }
         if (event.error === 'not-allowed' || event.error === 'permission-denied') {
           recordingRef.current = false;
           setIsRecording(false);
@@ -3148,6 +3191,14 @@ export default function App() {
       }
     }, 120);
   }, [inputValue, unlock]);
+
+  const toggleRecording = useCallback(() => {
+    if (recordingRef.current) {
+      stopRecording();
+      return;
+    }
+    startRecording();
+  }, [startRecording, stopRecording]);
 
   // --- New: PWA install prompt handling ---
   useEffect(() => {
@@ -4039,10 +4090,34 @@ export default function App() {
                   value={inputValue}
                   onChange={(e) => setInputValue(e.target.value)}
                   placeholder="Talk to your agent..."
-                  className={`w-full bg-[#2a2a2e]/80 backdrop-blur-md border-[2px] border-[#3a3a3e] rounded-2xl py-5 lg:py-6 pl-14 pr-36 font-mono text-base lg:text-lg text-[#e8e8ec] placeholder:text-[#888] focus:outline-none transition-all shadow-[inset_0_0_0_1px_rgba(34,197,94,0.1),0_0_30px_rgba(34,197,94,0.05)] focus:border-[#22c55e]/60 focus:shadow-[inset_0_0_0_1px_rgba(34,197,94,0.3),0_0_40px_rgba(34,197,94,0.1)] ${isRecording ? 'border-[#22c55e]/60 animate-[pulse_1.5s_ease-in-out_infinite]' : ''}`}
+                  className={`w-full bg-[#2a2a2e]/80 backdrop-blur-md border-[2px] border-[#3a3a3e] rounded-2xl py-5 lg:py-6 pl-14 pr-60 font-mono text-base lg:text-lg text-[#e8e8ec] placeholder:text-[#888] focus:outline-none transition-all shadow-[inset_0_0_0_1px_rgba(34,197,94,0.1),0_0_30px_rgba(34,197,94,0.05)] focus:border-[#22c55e]/60 focus:shadow-[inset_0_0_0_1px_rgba(34,197,94,0.3),0_0_40px_rgba(34,197,94,0.1)] ${isRecording ? 'border-[#22c55e]/60 animate-[pulse_1.5s_ease-in-out_infinite]' : ''}`}
                 />
                 <div className="absolute right-3 top-1/2 -translate-y-1/2 flex items-center gap-2">
                   <WaveformIndicator agentState={agentState} isRecording={isRecording} />
+                  <button
+                    type="button"
+                    onClick={() => setTtsEnabled(v => !v)}
+                    aria-label={ttsEnabled ? 'Disable voice playback' : 'Enable voice playback'}
+                    className={`grid place-items-center w-10 h-10 rounded-xl border-[1px] transition-all ${ttsEnabled ? 'bg-[#22c55e]/10 text-[#22c55e] border-[#22c55e]/30 hover:bg-[#22c55e]/20' : 'bg-[#3a3a3e]/50 text-[#888] border-[#3a3a3e] hover:bg-[#3a3a3e]/80'}`}
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" className="w-4 h-4" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M11 5 6 9H3v6h3l5 4V5Z" />
+                      {ttsEnabled ? <path d="M15.5 8.5a5 5 0 0 1 0 7" /> : <path d="m16 8 4 8" />}
+                    </svg>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={toggleRecording}
+                    aria-label={isRecording ? 'Stop voice recording' : 'Start voice recording'}
+                    className={`grid place-items-center w-10 h-10 rounded-xl border-[1px] transition-all ${isRecording ? 'bg-[#ef4444]/15 text-[#ef4444] border-[#ef4444]/40 animate-pulse' : 'bg-[#22c55e]/10 text-[#22c55e] border-[#22c55e]/30 hover:bg-[#22c55e]/20 hover:border-[#22c55e]/50 active:scale-95'}`}
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" className="w-4 h-4" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <rect x="9" y="2" width="6" height="12" rx="3" />
+                      <path d="M5 10a7 7 0 0 0 14 0" />
+                      <path d="M12 17v5" />
+                      <path d="M8 22h8" />
+                    </svg>
+                  </button>
                   <button
                     type="submit"
                     disabled={!inputValue.trim() || agentState !== 'default'}
@@ -4051,6 +4126,9 @@ export default function App() {
                     Execute <Send size={13} strokeWidth={2.5} />
                   </button>
                 </div>
+                {voiceError && (
+                  <p className="mt-2 px-1 font-mono text-[10px] text-[#ef4444]">{voiceError}</p>
+                )}
               </form>
             </footer>
             {/* Split-view preview panel */}
