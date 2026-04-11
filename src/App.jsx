@@ -346,7 +346,24 @@ const tryStreamJobViaSSE = async ({ baseUrl, jobId, timeoutMs = 15000 }) => {
 const loadMessages = () => {
   try {
     const saved = localStorage.getItem('80m-agent-messages');
-    if (saved) return JSON.parse(saved);
+    if (saved) {
+      const msgs = JSON.parse(saved);
+      // Filter out phantom ping/acknowledge pairs that come from connectivity checks
+      // These are identifiable: user msg contains "ping" or "acknowledge", followed by
+      // an assistant msg containing "acknowledge" — and they happened close together
+      const cleaned = msgs.filter((msg, i) => {
+        const prev = msgs[i - 1];
+        const isPingUser = msg.role === 'user' &&
+          (msg.content?.toLowerCase().includes('ping') ||
+           msg.content?.toLowerCase().includes('acknowledge'));
+        const isAckAssistant = msg.role === 'assistant' &&
+          msg.content?.toLowerCase().includes('acknowledge');
+        const isPongPair = prev && isPingUser && isAckAssistant &&
+          (msg.id - prev.id) < 10000; // within 10 seconds
+        return !isPongPair;
+      });
+      return cleaned;
+    }
   } catch {}
   return [];
 };
@@ -356,6 +373,26 @@ const saveMessages = (msgs) => {
     localStorage.setItem('80m-agent-messages', JSON.stringify(msgs.slice(-100)));
   } catch {}
 };
+
+// Ref to always hold the latest messages — bypasses React batching/async issues
+let _messagesRef = null;
+const _setMessagesRef = (msgs) => { _messagesRef = msgs; };
+
+// Flush to localStorage on every message update — synchronous, no batching
+const flushMessages = () => {
+  if (_messagesRef !== null) saveMessages(_messagesRef);
+};
+
+// Sync flush on page hide/close (covers nativefier, PWA backgrounding, tab switch)
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushMessages();
+  });
+}
+if (typeof window !== 'undefined') {
+  window.addEventListener('pagehide', flushMessages);
+  window.addEventListener('beforeunload', flushMessages);
+}
 
 // =====================================================================
 // PWA INSTALL HELPERS
@@ -2854,7 +2891,16 @@ export default function App() {
 
   const scrollRef = useRef(null);
 
-  const [messages, setMessages] = useState(() => loadMessages());
+  const [messages, _rawSetMessages] = useState(() => loadMessages());
+  // Wrap setMessages to update ref + localStorage synchronously on every update
+  const setMessages = useCallback((update) => {
+    _rawSetMessages(prev => {
+      const next = typeof update === 'function' ? update(prev) : update;
+      _setMessagesRef(next);
+      saveMessages(next);
+      return next;
+    });
+  }, []);
   const [inputValue, setInputValue] = useState('');
 
   // --- New: Build agents from config ---
