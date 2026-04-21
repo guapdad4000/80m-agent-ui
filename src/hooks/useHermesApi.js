@@ -56,20 +56,21 @@ export default function useHermesApi() {
    * Send a message to Hermes. Falls back to offline queue if unreachable.
    * @param {string} text
    * @param {string} agentId
+   * @param {string} provider  <-- Added
    * @returns {Promise<{queued: boolean, jobId?: string, response?: string}>}
    */
-  const sendMessage = useCallback(async (text, agentId) => {
+  const sendMessage = useCallback(async (text, agentId, provider = 'hermes') => {
     const connected = await checkConnection();
 
     if (!connected) {
       // Queue for later
-      const id = queueMessage({ text, agent: agentId });
+      const id = queueMessage({ text, agent: agentId, provider });
       return { queued: true, queueId: id };
     }
 
     // Submit the job
     const endpoint = isOpenAICompatibleEndpoint(HERMES_URL) ? HERMES_URL : `${HERMES_URL}/chat`;
-    const payload = buildApiPayload({ endpoint, message: text, agentId });
+    const payload = buildApiPayload({ endpoint, message: text, agentId, provider }); // Added provider
 
     const res = await fetch(endpoint, {
       method: 'POST',

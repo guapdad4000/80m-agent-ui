@@ -7,6 +7,8 @@ export default defineConfig({
   plugins: [
     react(),
     VitePWA({
+      // Manual registration in src/main.jsx so we can disable SW in desktop shells.
+      injectRegister: false,
       registerType: 'autoUpdate',
       includeAssets: ['favicon.svg', 'robots.txt'],
       manifest: {
@@ -80,22 +82,27 @@ export default defineConfig({
         skipWaiting: true,
         clientsClaim: true,
         runtimeCaching: [
-          // NetworkFirst for API calls — falls back to cache if network fails
+          // SSE streams must never be cached/intercepted by Workbox.
           {
-            urlPattern: /^http:\/\/localhost:5174\/chat/i,
+            urlPattern: /^http:\/\/(localhost|127\.0\.0\.1):5174\/chat\/stream(?:\/|\?|$)/i,
+            handler: 'NetworkOnly',
+          },
+          // Cache status polling endpoint only (NOT /chat/stream).
+          {
+            urlPattern: /^http:\/\/localhost:5174\/chat\/status\//i,
             handler: 'NetworkFirst',
             options: {
-              cacheName: 'hermes-chat-api',
+              cacheName: 'hermes-chat-status',
               networkTimeoutSeconds: 5,
               expiration: { maxEntries: 50, maxAgeSeconds: 60 * 60 },
               cacheableResponse: { statuses: [0, 200] },
             },
           },
           {
-            urlPattern: /^http:\/\/127\.0\.0\.1:5174\/chat/i,
+            urlPattern: /^http:\/\/127\.0\.0\.1:5174\/chat\/status\//i,
             handler: 'NetworkFirst',
             options: {
-              cacheName: 'hermes-chat-api-alt',
+              cacheName: 'hermes-chat-status-alt',
               networkTimeoutSeconds: 5,
               expiration: { maxEntries: 50, maxAgeSeconds: 60 * 60 },
               cacheableResponse: { statuses: [0, 200] },

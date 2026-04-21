@@ -2,7 +2,7 @@ const ENDPOINTS_KEY = '80m-endpoint-config';
 
 const DEFAULT_ENDPOINTS = {
   hermesBase: 'http://localhost:5174',
-  localApiBase: 'http://localhost:5175',
+  localApiBase: 'http://localhost:5183',
   webhookBase: 'http://localhost:5176',
 };
 

@@ -3,7 +3,7 @@ export const isOpenAICompatibleEndpoint = (url = '') => {
   return normalized.includes('/v1/chat/completions') || normalized.includes('/chat/completions');
 };
 
-export const buildApiPayload = ({ endpoint, message, agentId }) => {
+export const buildApiPayload = ({ endpoint, message, agentId, provider }) => {
   if (isOpenAICompatibleEndpoint(endpoint)) {
     return {
       model: 'local-model',
@@ -13,7 +13,7 @@ export const buildApiPayload = ({ endpoint, message, agentId }) => {
       metadata: { agent_id: agentId },
     };
   }
-  return { message, agent_id: agentId };
+  return { message, agent_id: agentId, provider };
 };
 
 export const extractAssistantText = (data) => {

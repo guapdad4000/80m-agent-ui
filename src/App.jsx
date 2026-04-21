@@ -225,6 +225,7 @@ const DEFAULT_CONFIG = {
     { id: 'knowledge_knaight', icon: 'Search', role: 'Research', color: '#f59e0b' },
     { id: 'clawdette', icon: 'CheckCircle2', role: 'Operations', color: '#ef4444' },
   ],
+  provider: 'hermes', // Added: 'hermes' or 'ollama'
   welcomeMessage: '',
   showPWAInstall: true,
 };
@@ -277,6 +278,8 @@ const tryStreamJobViaSSE = async ({ baseUrl, jobId, timeoutMs = 15000 }) => {
       let settled = false;
       let hasTraffic = false;
       let responseText = '';
+      let sessionId = null;
+      let streamedThreadId = null;
       const toolEvents = [];
       let es;
       let timer;
@@ -297,14 +300,16 @@ const tryStreamJobViaSSE = async ({ baseUrl, jobId, timeoutMs = 15000 }) => {
         const data = event?.data;
         if (!data) return;
         if (data === '[DONE]') {
-          finish({ completed: true, responseText: responseText.trim(), events: toolEvents });
+          finish({ completed: true, responseText: responseText.trim(), events: toolEvents, sessionId, thread_id: streamedThreadId });
           return;
         }
 
         try {
           const parsed = JSON.parse(data);
+          if (parsed.session_id) sessionId = parsed.session_id;
+          if (parsed.thread_id) streamedThreadId = parsed.thread_id;
           if (parsed.status === 'failed') {
-            finish({ failed: true, error: parsed.error || parsed.result?.error || 'Hermes job failed' });
+            finish({ failed: true, error: parsed.error || parsed.result?.error || 'Hermes job failed', sessionId, thread_id: streamedThreadId });
             return;
           }
           if (Array.isArray(parsed.events)) {
@@ -316,8 +321,8 @@ const tryStreamJobViaSSE = async ({ baseUrl, jobId, timeoutMs = 15000 }) => {
           if (delta) responseText += delta;
           if (parsed.response) responseText = parsed.response;
 
-          if (parsed.status === 'completed') {
-            finish({ completed: true, responseText: (parsed.response || responseText || '').trim(), events: toolEvents });
+          if (parsed.status === 'completed' || parsed.type === 'done') {
+            finish({ completed: true, responseText: (parsed.response || responseText || '').trim(), events: toolEvents, sessionId, thread_id: streamedThreadId });
           }
         } catch {
           responseText += String(data);
@@ -326,7 +331,7 @@ const tryStreamJobViaSSE = async ({ baseUrl, jobId, timeoutMs = 15000 }) => {
 
       es.onerror = () => {
         if (hasTraffic) {
-          finish({ completed: false, partial: true, responseText: responseText.trim(), events: toolEvents });
+          finish({ completed: false, partial: true, responseText: responseText.trim(), events: toolEvents, sessionId, thread_id: streamedThreadId });
         } else {
           finish(null);
         }
@@ -343,34 +348,130 @@ const tryStreamJobViaSSE = async ({ baseUrl, jobId, timeoutMs = 15000 }) => {
 // =====================================================================
 // PERSISTENCE HELPERS
 // =====================================================================
+const LEGACY_MESSAGES_KEY = '80m-agent-messages';
+const AGENT_THREADS_KEY = '80m-agent-messages-by-agent';
+const AGENT_SESSION_IDS_KEY = '80m-agent-session-ids';
+const AGENT_ACTIVE_THREAD_IDS_KEY = '80m-agent-active-thread-ids';
+const AGENT_THREAD_LISTS_KEY = '80m-agent-thread-lists';
+
+const loadAgentSessionIds = () => {
+  try {
+    const raw = localStorage.getItem(AGENT_SESSION_IDS_KEY);
+    return raw ? JSON.parse(raw) || {} : {};
+  } catch {
+    return {};
+  }
+};
+
+const saveAgentSessionIds = (sessionIds) => {
+  try {
+    localStorage.setItem(AGENT_SESSION_IDS_KEY, JSON.stringify(sessionIds || {}));
+  } catch {}
+};
+
+const loadActiveThreadIds = () => {
+  try {
+    const raw = localStorage.getItem(AGENT_ACTIVE_THREAD_IDS_KEY);
+    return raw ? JSON.parse(raw) || {} : {};
+  } catch {
+    return {};
+  }
+};
+
+const saveActiveThreadIds = (threadIds) => {
+  try {
+    localStorage.setItem(AGENT_ACTIVE_THREAD_IDS_KEY, JSON.stringify(threadIds || {}));
+  } catch {}
+};
+
+const loadThreadLists = () => {
+  try {
+    const raw = localStorage.getItem(AGENT_THREAD_LISTS_KEY);
+    return raw ? JSON.parse(raw) || {} : {};
+  } catch {
+    return {};
+  }
+};
+
+const saveThreadLists = (threadLists) => {
+  try {
+    localStorage.setItem(AGENT_THREAD_LISTS_KEY, JSON.stringify(threadLists || {}));
+  } catch {}
+};
+
+const makeThreadStorageKey = (agentId, threadId = 'default') => `${agentId}::${threadId}`;
+
+const mapApiThreads = (threads = []) => {
+  if (!Array.isArray(threads)) return [];
+  return threads.map((thread, idx) => ({
+    id: thread.id || `thread-${idx}`,
+    title: thread.title || 'New conversation',
+    preview: thread.preview || '',
+    session_id: thread.session_id || null,
+    updated_at: thread.updated_at || thread.created_at || null,
+    created_at: thread.created_at || null,
+  }));
+};
+
+const mapHermesMessagesToUi = (messages = []) => {
+  if (!Array.isArray(messages)) return [];
+  return messages
+    .filter(msg => msg && (msg.role === 'user' || msg.role === 'assistant'))
+    .map((msg, idx) => ({
+      id: Math.max(1, Math.round(Number(msg.timestamp || 0) * 1000) + idx),
+      role: msg.role,
+      content: msg.content || '',
+    }));
+};
+
+const cleanMessages = (msgs) => {
+  if (!Array.isArray(msgs)) return [];
+  return msgs.filter((msg, i) => {
+    const prev = msgs[i - 1];
+    const isPingUser = msg?.role === 'user' &&
+      (msg?.content?.toLowerCase?.().includes('ping') ||
+       msg?.content?.toLowerCase?.().includes('acknowledge'));
+    const isAckAssistant = msg?.role === 'assistant' &&
+      msg?.content?.toLowerCase?.().includes('acknowledge');
+    const isPongPair = prev && isPingUser && isAckAssistant &&
+      (Number(msg?.id) - Number(prev?.id)) < 10000;
+    return !isPongPair;
+  });
+};
+
 const loadMessages = () => {
   try {
-    const saved = localStorage.getItem('80m-agent-messages');
-    if (saved) {
-      const msgs = JSON.parse(saved);
-      // Filter out phantom ping/acknowledge pairs that come from connectivity checks
-      // These are identifiable: user msg contains "ping" or "acknowledge", followed by
-      // an assistant msg containing "acknowledge" — and they happened close together
-      const cleaned = msgs.filter((msg, i) => {
-        const prev = msgs[i - 1];
-        const isPingUser = msg.role === 'user' &&
-          (msg.content?.toLowerCase().includes('ping') ||
-           msg.content?.toLowerCase().includes('acknowledge'));
-        const isAckAssistant = msg.role === 'assistant' &&
-          msg.content?.toLowerCase().includes('acknowledge');
-        const isPongPair = prev && isPingUser && isAckAssistant &&
-          (msg.id - prev.id) < 10000; // within 10 seconds
-        return !isPongPair;
-      });
-      return cleaned;
-    }
+    const saved = localStorage.getItem(LEGACY_MESSAGES_KEY);
+    if (saved) return cleanMessages(JSON.parse(saved));
   } catch {}
   return [];
 };
 
 const saveMessages = (msgs) => {
   try {
-    localStorage.setItem('80m-agent-messages', JSON.stringify(msgs.slice(-100)));
+    localStorage.setItem(LEGACY_MESSAGES_KEY, JSON.stringify((msgs || []).slice(-100)));
+  } catch {}
+};
+
+const loadMessagesForAgent = (agentId) => {
+  try {
+    const raw = localStorage.getItem(AGENT_THREADS_KEY);
+    if (!raw) return loadMessages();
+    const parsed = JSON.parse(raw) || {};
+    const msgs = parsed?.[agentId];
+    if (Array.isArray(msgs)) return cleanMessages(msgs);
+  } catch {}
+  return loadMessages();
+};
+
+const saveMessagesForAgent = (agentId, msgs) => {
+  try {
+    const raw = localStorage.getItem(AGENT_THREADS_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    parsed[agentId] = (msgs || []).slice(-100);
+    localStorage.setItem(AGENT_THREADS_KEY, JSON.stringify(parsed));
+    // Keep legacy key synced for backward compatibility.
+    saveMessages(msgs || []);
   } catch {}
 };
 
@@ -426,6 +527,21 @@ const SettingsPanel = ({ config, onSave, onClose }) => {
     setSaveStatus('saved');
     setTimeout(() => setSaveStatus(''), 2000);
   };
+
+  // Add a provider toggle UI
+  const ProviderToggle = () => (
+    <div className="flex items-center space-x-2 p-4 border-b border-white/10">
+      <span className="text-sm font-medium">Agent Provider:</span>
+      <select 
+        value={localConfig.provider || 'hermes'} 
+        onChange={(e) => setLocalConfig({...localConfig, provider: e.target.value})}
+        className="bg-zinc-800 text-white p-2 rounded text-sm"
+      >
+        <option value="hermes">Hermes (Powerful)</option>
+        <option value="ollama">Ollama (Local Gemma)</option>
+      </select>
+    </div>
+  );
 
   const handleExport = () => {
     const blob = new Blob([JSON.stringify(localConfig, null, 2)], { type: 'application/json' });
@@ -513,7 +629,7 @@ const SettingsPanel = ({ config, onSave, onClose }) => {
   const handleTestAllEndpoints = async () => {
     const checks = [
       { name: 'Hermes /sessions', url: `${endpointConfig.hermesBase}/sessions` },
-      { name: 'Local API /fs/list', url: `${endpointConfig.localApiBase}/fs/list?path=/` },
+      { name: 'Hermes /health', url: `${endpointConfig.hermesBase}/health` },
       { name: 'Webhook /webhooks', url: `${endpointConfig.webhookBase}/webhooks` },
     ];
     const results = [];
@@ -660,10 +776,12 @@ const SettingsPanel = ({ config, onSave, onClose }) => {
         {/* CONNECTION TAB */}
         {activeTab === 'connection' && (
           <div className="space-y-4">
+            <ProviderToggle />
             <div className="space-y-2">
               <label className="flex items-center gap-2 font-mono text-[9px] font-black uppercase tracking-[0.15em] text-[#111]">
                 <Plug size={12} /> API Endpoint
               </label>
+
               <div className="flex gap-2">
                 <input
                   type="text"
@@ -945,11 +1063,44 @@ const SettingsPanel = ({ config, onSave, onClose }) => {
           </div>
         )}
 
-        {/* CONFIG TAB */}
-        {activeTab === 'config' && (
+        {/* CONNECTION TAB */}
+        {activeTab === 'connection' && (
           <div className="space-y-4">
+            <ProviderToggle />
             <div className="space-y-2">
-              <p className="font-mono text-[9px] font-black uppercase text-[#555]">CONFIG_MANAGEMENT</p>
+              <label className="flex items-center gap-2 font-mono text-[9px] font-black uppercase tracking-[0.15em] text-[#111]">
+                <Plug size={12} /> API Endpoint
+              </label>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={localConfig.apiEndpoint}
+                  onChange={e => setLocalConfig(p => ({ ...p, apiEndpoint: e.target.value }))}
+                  placeholder={`${HERMES_BASE}/chat`}
+                  className="flex-1 bg-white border-[3px] border-[#111] px-3 py-2 font-mono text-xs focus:outline-none focus:shadow-[4px_4px_0_0_#111]"
+                />
+                <button
+                  onClick={handleTestConnection}
+                  className="px-4 py-2 border-[3px] border-[#111] bg-[#111] text-[#22c55e] font-mono text-[10px] font-black uppercase hover:bg-[#222] transition-colors"
+                >
+                  TEST
+                </button>
+              </div>
+              {testResult && (
+                <div className={`mt-2 p-2 border-[2px] border-[#111] font-mono text-[10px] ${
+                  testResult.ok === true ? 'bg-[#dcfce7] text-[#166534]' :
+                  testResult.ok === false ? 'bg-[#fee2e2] text-[#991b1b]' : 'bg-[#fef9c3] text-[#854d0e]'
+                }`}>
+                  {testResult.message}
+                </div>
+              )}
+              <p className="font-mono text-[8px] text-[#666]">
+                Leave empty or disable to use demo mode (simulated responses)
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <p className="font-mono text-[9px] font-black uppercase text-[#555]">IMPORT_EXPORT</p>
               <div className="flex gap-2">
                 <button
                   onClick={handleExport}
@@ -1300,20 +1451,20 @@ const JobsPipelinePanel = ({ onClose }) => {
       // Try Hermes jobs endpoint
       let res = await fetch(`${HERMES_BASE}/jobs`, { signal: AbortSignal.timeout(5000) });
       if (!res.ok) {
-        // Fallback: try /fs/list for a jobs directory
-        res = await fetch(`${HERMES_BASE}/fs/list?path=/home/falcon/.hermes/jobs`, { signal: AbortSignal.timeout(5000) });
+        // Fallback: try /sessions as jobs proxy (shows recent sessions)
+        res = await fetch(`${HERMES_BASE}/sessions`, { signal: AbortSignal.timeout(5000) });
       }
       if (res.ok) {
         let data = await res.json();
-        // If it's a fs/list response, build job cards from files
-        if (data.files) {
-          data = (data.files || []).map(f => ({
-            id: f.name,
-            agent: 'unknown',
-            status: f.type === 'dir' ? 'running' : 'completed',
-            timestamp: f.mtime || Date.now(),
-          }));
-        }
+        // /sessions returns { sessions: [...] } — map to job cards
+        const sessions = data.sessions || data || [];
+        data = sessions.map(s => ({
+          id: s.id,
+          agent: s.lastActive || 'unknown',
+          status: 'completed',
+          timestamp: s.lastUpdated ? new Date(s.lastUpdated).getTime() : Date.now(),
+          title: s.title || s.id,
+        }));
         setJobs(Array.isArray(data) ? data : []);
       } else {
         setJobs([]);
@@ -1744,8 +1895,14 @@ const SkillsHubPanel = ({ onClose }) => {
     setLoading(true);
     setError('');
     try {
-      const res = await fetch(`${HERMES_BASE}/fs/list?path=/home/falcon/.hermes/skills`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      // Fetch skills from local FS API
+      const res = await fetch(`${LOCAL_API_BASE}/skills`, { signal: AbortSignal.timeout(5000) });
+      if (!res.ok) {
+        // Skills endpoint not available — show empty state
+        setSkills([]);
+        setLoading(false);
+        return;
+      }
       const data = await res.json();
       const dirs = (data.files || []).filter(f => f.type === 'dir');
 
@@ -2392,11 +2549,8 @@ const FileTree = ({ rootPath, onFileSelect, selectedFile, onRefresh }) => {
   const fetchDir = async (path) => {
     setLoading(true);
     try {
-      // Try port 5174 first
-      let res = await fetch(`${HERMES_BASE}/fs/list?path=${encodeURIComponent(path)}`);
-      if (!res.ok) {
-        res = await fetch(`${LOCAL_API_BASE}/fs/list?path=${encodeURIComponent(path)}`);
-      }
+      // File browsing via local FS API at port 5180
+      let res = await fetch(`${LOCAL_API_BASE}/fs/list?path=${encodeURIComponent(path)}`);
       if (res.ok) {
         const data = await res.json();
         return data.files || [];
@@ -2954,7 +3108,7 @@ export default function App() {
   const [hoveredMsgId, setHoveredMsgId] = useState(null);
   const [cmdSearch, setCmdSearch] = useState('');
   const [toolEventsByMsg, setToolEventsByMsg] = useState({}); // msgId -> array of tool events
-  const [expandedTools, setExpandedTools] = useState({}); // `${msgId}-${toolIndex}` -> bool
+  const [expandedTools, setExpandedTools] = useState({}); // msgId -> bool (assistant step thread)
   const [splitView, setSplitView] = useState(false);
   const [previewContent, setPreviewContent] = useState('');
   const [previewFilePath, setPreviewFilePath] = useState('');
@@ -2963,6 +3117,11 @@ export default function App() {
   const [showOnboarding, setShowOnboarding] = useState(() => !localStorage.getItem('80m-onboarding-complete'));
   const [onboardingStep, setOnboardingStep] = useState(0);
   const [messageCount, setMessageCount] = useState(0);
+  const [unreadByAgent, setUnreadByAgent] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('80m-unread-by-agent')) || {}; } catch { return {}; }
+  });
+  const [pendingByAgent, setPendingByAgent] = useState({});
+  const [notificationToasts, setNotificationToasts] = useState([]);
 
   // --- Offline support ---
   const [queuedCount, setQueuedCount] = useState(() => getQueue().length);
@@ -3013,7 +3172,42 @@ export default function App() {
 
   const scrollRef = useRef(null);
 
-  const [messages, _rawSetMessages] = useState(() => loadMessages());
+  const initialAgentId = config.agents[0]?.id || 'prawnius';
+  const [activeEmployee, setActiveEmployee] = useState(initialAgentId);
+  const [activeThreadIds, setActiveThreadIds] = useState(() => loadActiveThreadIds());
+  const activeThreadIdsRef = useRef(activeThreadIds);
+  useEffect(() => {
+    activeThreadIdsRef.current = activeThreadIds;
+    saveActiveThreadIds(activeThreadIds);
+  }, [activeThreadIds]);
+  const [threadListByAgent, setThreadListByAgent] = useState(() => loadThreadLists());
+  useEffect(() => {
+    saveThreadLists(threadListByAgent);
+  }, [threadListByAgent]);
+  const setActiveThreadId = useCallback((agentId, threadId) => {
+    if (!agentId || !threadId) return;
+    setActiveThreadIds(prev => prev[agentId] === threadId ? prev : { ...prev, [agentId]: threadId });
+  }, []);
+  const currentThreadId = activeThreadIds[activeEmployee] || 'default';
+  const currentThreadKey = makeThreadStorageKey(activeEmployee, currentThreadId);
+  const agentThreadsRef = useRef({
+    [currentThreadKey]: loadMessagesForAgent(currentThreadKey),
+  });
+  const [agentSessionIds, setAgentSessionIds] = useState(() => loadAgentSessionIds());
+  const agentSessionIdsRef = useRef(agentSessionIds);
+  useEffect(() => {
+    agentSessionIdsRef.current = agentSessionIds;
+    saveAgentSessionIds(agentSessionIds);
+  }, [agentSessionIds]);
+  const setAgentSessionId = useCallback((agentId, sessionId, threadId = null) => {
+    if (!agentId || !sessionId) return;
+    const key = makeThreadStorageKey(agentId, threadId || activeThreadIdsRef.current[agentId] || 'default');
+    setAgentSessionIds(prev => prev[key] === sessionId ? prev : { ...prev, [key]: sessionId });
+  }, []);
+
+  const [messages, _rawSetMessages] = useState(() => {
+    return agentThreadsRef.current[currentThreadKey] || loadMessagesForAgent(currentThreadKey);
+  });
   const messageIdRef = useRef(0);
   useEffect(() => {
     const maxExistingId = messages.reduce((maxId, msg) => {
@@ -3027,15 +3221,118 @@ export default function App() {
     messageIdRef.current = Math.max(now, messageIdRef.current + 1);
     return messageIdRef.current;
   }, []);
-  // Wrap setMessages to update ref + localStorage synchronously on every update
-  const setMessages = useCallback((update) => {
-    _rawSetMessages(prev => {
-      const next = typeof update === 'function' ? update(prev) : update;
+
+  const activeEmployeeRef = useRef(activeEmployee);
+  useEffect(() => { activeEmployeeRef.current = activeEmployee; }, [activeEmployee]);
+
+  const updateAgentThread = useCallback((agentId, threadId, update) => {
+    const key = makeThreadStorageKey(agentId, threadId || activeThreadIdsRef.current[agentId] || 'default');
+    const prev = agentThreadsRef.current[key] || loadMessagesForAgent(key);
+    const next = typeof update === 'function' ? update(prev) : update;
+    agentThreadsRef.current[key] = next;
+    saveMessagesForAgent(key, next);
+    if (activeEmployeeRef.current === agentId && (activeThreadIdsRef.current[agentId] || 'default') === (threadId || activeThreadIdsRef.current[agentId] || 'default')) {
       _setMessagesRef(next);
-      saveMessages(next);
-      return next;
-    });
+      _rawSetMessages(next);
+    }
   }, []);
+
+  const setMessages = useCallback((update) => {
+    updateAgentThread(activeEmployeeRef.current, activeThreadIdsRef.current[activeEmployeeRef.current] || 'default', update);
+  }, [updateAgentThread]);
+
+  const pushToast = useCallback((toast) => {
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    setNotificationToasts(prev => [...prev, { id, ...toast }]);
+    setTimeout(() => {
+      setNotificationToasts(prev => prev.filter(t => t.id !== id));
+    }, 4500);
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem('80m-unread-by-agent', JSON.stringify(unreadByAgent || {}));
+  }, [unreadByAgent]);
+
+  const fetchThreadsForAgent = useCallback(async (agentId) => {
+    const res = await fetch(`${HERMES_BASE}/threads?agent_id=${encodeURIComponent(agentId)}`, {
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const mapped = mapApiThreads(data?.threads || []);
+    setThreadListByAgent(prev => ({ ...prev, [agentId]: mapped }));
+    if (mapped[0]?.id && !activeThreadIdsRef.current[agentId]) {
+      setActiveThreadId(agentId, mapped[0].id);
+    }
+    return mapped;
+  }, [setActiveThreadId]);
+
+  const createConversation = useCallback(async (agentId = activeEmployeeRef.current) => {
+    const res = await fetch(`${HERMES_BASE}/threads`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agent_id: agentId, title: 'New conversation' }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const thread = data?.thread;
+    if (!thread?.id) throw new Error('Missing thread id');
+    setThreadListByAgent(prev => ({
+      ...prev,
+      [agentId]: [thread, ...(prev[agentId] || []).filter(t => t.id !== thread.id)],
+    }));
+    setActiveThreadId(agentId, thread.id);
+    updateAgentThread(agentId, thread.id, []);
+    setAgentSessionId(agentId, '', thread.id);
+    return thread;
+  }, [setActiveThreadId, setAgentSessionId, updateAgentThread]);
+
+  // When switching agents or threads, swap to the selected thread and clear unread badge.
+  useEffect(() => {
+    const key = makeThreadStorageKey(activeEmployee, currentThreadId);
+    const thread = agentThreadsRef.current[key] || loadMessagesForAgent(key);
+    agentThreadsRef.current[key] = thread;
+    _setMessagesRef(thread);
+    _rawSetMessages(thread);
+    setUnreadByAgent(prev => ({ ...prev, [activeEmployee]: 0 }));
+  }, [activeEmployee, currentThreadId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      let threads = threadListByAgent[activeEmployee] || [];
+      if (threads.length === 0) {
+        threads = await fetchThreadsForAgent(activeEmployee).catch(() => []);
+      }
+      let threadId = activeThreadIdsRef.current[activeEmployee] || threads[0]?.id;
+      if (!threadId) {
+        const created = await createConversation(activeEmployee).catch(() => null);
+        threadId = created?.id;
+      }
+      if (!threadId || cancelled) return;
+      setActiveThreadId(activeEmployee, threadId);
+      const key = makeThreadStorageKey(activeEmployee, threadId);
+      const existingThread = agentThreadsRef.current[key] || [];
+      if (existingThread.length > 0) return;
+      const res = await fetch(`${HERMES_BASE}/agent-context/${encodeURIComponent(activeEmployee)}?thread_id=${encodeURIComponent(threadId)}&limit=120`, {
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (cancelled) return;
+      if (Array.isArray(data?.threads)) {
+        setThreadListByAgent(prev => ({ ...prev, [activeEmployee]: mapApiThreads(data.threads) }));
+      }
+      if (data?.thread_id) setActiveThreadId(activeEmployee, data.thread_id);
+      if (data?.session_id) setAgentSessionId(activeEmployee, data.session_id, data.thread_id || threadId);
+      const hydrated = mapHermesMessagesToUi(data?.messages || []);
+      updateAgentThread(activeEmployee, data?.thread_id || threadId, hydrated);
+    };
+    run().catch(() => {});
+    return () => { cancelled = true; };
+  }, [activeEmployee, currentThreadId, threadListByAgent, fetchThreadsForAgent, createConversation, setActiveThreadId, setAgentSessionId, updateAgentThread]);
+
   const [inputValue, setInputValue] = useState('');
 
   // --- New: Build agents from config ---
@@ -3049,9 +3346,8 @@ export default function App() {
   // --- Original: Core State ---
   const [agentState, setAgentState] = useState('default');
   const [agentThinking, setAgentThinking] = useState(false);
-  const [activeEmployee, setActiveEmployee] = useState(config.agents[0]?.id || 'prawnius');
   const [loadPhase, setLoadPhase] = useState('logo');
-  const [viewMode, setViewMode] = useState('session'); // 'session' or 'history'
+  const [viewMode, setViewMode] = useState('agents'); // agents | session | projects
 
   // --- Voice input state (Shift+Space hold-to-record) ---
   const [isRecording, setIsRecording] = useState(false);
@@ -3344,9 +3640,9 @@ export default function App() {
         const ok = await checkConnection();
         if (!ok) throw new Error('Hermes unreachable');
       }),
-      check('Hermes /fs/list', async () => {
-        const fs = await fetchFsList('/');
-        if (!fs) throw new Error('No response');
+      check('Hermes /health', async () => {
+        const res = await fetch(`${HERMES_BASE}/health`, { signal: AbortSignal.timeout(5000) });
+        if (!res.ok) throw new Error(`Status ${res.status}`);
       }),
       check('Webhook Service /webhooks', async () => {
         const res = await fetch(`${WEBHOOK_BASE}/webhooks`, { signal: AbortSignal.timeout(5000) });
@@ -3407,12 +3703,15 @@ export default function App() {
     e.preventDefault();
     if (!inputValue.trim()) return;
 
+    const targetAgent = activeEmployee;
+    const targetThreadId = activeThreadIdsRef.current[targetAgent] || currentThreadId;
+
     const contextPrefix = contextVars.length > 0
       ? `[${projectNamespace || 'global'}] `
       : '';
     const displayMsg = contextPrefix + inputValue;
     const userMsgId = nextMessageId();
-    setMessages(prev => [...prev, { id: userMsgId, role: 'user', content: displayMsg }]);
+    updateAgentThread(targetAgent, targetThreadId, prev => [...prev, { id: userMsgId, role: 'user', content: displayMsg }]);
     setInputValue('');
     playSendClick();
     pulseMascot('jump', 500);
@@ -3422,12 +3721,12 @@ export default function App() {
     if (config.apiEnabled && config.apiEndpoint) {
       // --- Offline-aware: queue if Hermes is unreachable ---
       if (!isHermesConnected || !isOnline) {
-        const queuedId = queueMessage({ text: displayMsg, agent: activeEmployee });
+        const queuedId = queueMessage({ text: displayMsg, agent: targetAgent });
         const assistantMsgId = nextMessageId();
-        setMessages(prev => [...prev, {
+        updateAgentThread(targetAgent, targetThreadId, prev => [...prev, {
           id: assistantMsgId,
           role: 'assistant',
-          employee: activeEmployee,
+          employee: targetAgent,
           content: `[Message queued — will send when Hermes reconnects. Queue: ${queueCount + 1}]`,
         }]);
         setQueuedCount(q => q + 1);
@@ -3437,35 +3736,55 @@ export default function App() {
 
       setAgentState('processing');
       setAgentThinking(true);
+      setPendingByAgent(prev => ({ ...prev, [targetAgent]: (prev[targetAgent] || 0) + 1 }));
       const assistantMsgId = nextMessageId();
       setToolEventsByMsg(prev => ({ ...prev, [assistantMsgId]: [] }));
 
       // Add placeholder assistant message (empty, we'll fill it when the job completes)
-      setMessages(prev => [...prev, { id: assistantMsgId, role: 'assistant', employee: activeEmployee, content: '' }]);
+      updateAgentThread(targetAgent, targetThreadId, prev => [...prev, { id: assistantMsgId, role: 'assistant', employee: targetAgent, content: '' }]);
 
       try {
         const contextBlock = contextVars.length > 0
           ? `\n[PROJECT CONTEXT — ${projectNamespace || 'global'}]\n${contextVars.map(v => `${v.key}: ${v.value}`).join('\n')}\n[/CONTEXT]\n`
           : '';
         const fullMessage = contextBlock + inputValue;
+        const currentSessionId = agentSessionIdsRef.current[makeThreadStorageKey(targetAgent, targetThreadId)] || null;
+        const agentProfile = config.agents.find(agent => agent.id === targetAgent) || null;
+        const payload = {
+          ...buildApiPayload({ endpoint: config.apiEndpoint, message: fullMessage, agentId: targetAgent }),
+          thread_id: targetThreadId,
+          session_id: currentSessionId,
+          agent_profile: agentProfile,
+        };
 
         const submitRes = await fetch(config.apiEndpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(buildApiPayload({ endpoint: config.apiEndpoint, message: fullMessage, agentId: activeEmployee })),
+          body: JSON.stringify(payload),
           signal: AbortSignal.timeout(30000),
         });
 
         if (!submitRes.ok) throw new Error(`HTTP ${submitRes.status}`);
         const submitData = await submitRes.json();
+        if (submitData?.thread_id) {
+          setActiveThreadId(targetAgent, submitData.thread_id);
+          setThreadListByAgent(prev => {
+            const existing = prev[targetAgent] || [];
+            if (existing.some(t => t.id === submitData.thread_id)) return prev;
+            return { ...prev, [targetAgent]: [{ id: submitData.thread_id, title: 'New conversation', session_id: submitData.session_id || null }, ...existing] };
+          });
+        }
+        if (submitData?.session_id) setAgentSessionId(targetAgent, submitData.session_id, submitData.thread_id || targetThreadId);
         const jobId = submitData.job_id;
         if (jobId) {
           pulseMascot('searching', 1200);
           let completed = false;
           const streamed = await tryStreamJobViaSSE({ baseUrl: HERMES_BASE, jobId });
+          if (streamed?.thread_id) setActiveThreadId(targetAgent, streamed.thread_id);
+          if (streamed?.sessionId) setAgentSessionId(targetAgent, streamed.sessionId, streamed.thread_id || targetThreadId);
           if (streamed?.completed) {
             setToolEventsByMsg(prev => ({ ...prev, [assistantMsgId]: streamed.events || [] }));
-            setMessages(prev => prev.map(m => m.id === assistantMsgId ? { ...m, content: streamed.responseText || '[No response returned]' } : m));
+            updateAgentThread(targetAgent, streamed?.thread_id || targetThreadId, prev => prev.map(m => m.id === assistantMsgId ? { ...m, content: streamed.responseText || '[No response returned]' } : m));
             completed = true;
           }
 
@@ -3480,16 +3799,20 @@ export default function App() {
               const statusData = await statusRes.json();
 
               if (statusData.status === 'queued' || statusData.status === 'running') {
+                if (statusData.thread_id) setActiveThreadId(targetAgent, statusData.thread_id);
+                if (statusData.session_id) setAgentSessionId(targetAgent, statusData.session_id, statusData.thread_id || targetThreadId);
                 setAgentState('typing');
                 continue;
               }
 
               if (statusData.status === 'completed') {
+                if (statusData.thread_id) setActiveThreadId(targetAgent, statusData.thread_id);
+                if (statusData.session_id) setAgentSessionId(targetAgent, statusData.session_id, statusData.thread_id || targetThreadId);
                 // Hermes returns { response: "...", events: [...] }
                 const responseText = statusData.response || statusData.result?.response || '';
                 const events = statusData.events || statusData.result?.events || [];
                 setToolEventsByMsg(prev => ({ ...prev, [assistantMsgId]: events.filter(e => e.type === 'tool') }));
-                setMessages(prev => prev.map(m => m.id === assistantMsgId ? { ...m, content: responseText || '[No response returned]' } : m));
+                updateAgentThread(targetAgent, statusData.thread_id || targetThreadId, prev => prev.map(m => m.id === assistantMsgId ? { ...m, content: responseText || '[No response returned]' } : m));
                 completed = true;
                 break;
               }
@@ -3503,7 +3826,7 @@ export default function App() {
         } else {
           const responseText = extractAssistantText(submitData);
           if (!responseText) throw new Error('No response payload from endpoint');
-          setMessages(prev => prev.map(m => m.id === assistantMsgId ? { ...m, content: responseText } : m));
+          updateAgentThread(targetAgent, targetThreadId, prev => prev.map(m => m.id === assistantMsgId ? { ...m, content: responseText } : m));
         }
         // SSE completion: update state + mascot animation
         setAgentState('job-done');
@@ -3511,16 +3834,25 @@ export default function App() {
         const nextCount = messageCount + 1;
         setMessageCount(nextCount);
         pulseMascot(nextCount % 5 === 0 ? 'jackpot' : 'job-done', 1500);
+        if (activeEmployeeRef.current !== targetAgent) {
+          setUnreadByAgent(prev => ({ ...prev, [targetAgent]: (prev[targetAgent] || 0) + 1 }));
+          pushToast({
+            type: 'reply',
+            agent: targetAgent,
+            text: `${targetAgent} replied`,
+          });
+        }
       } catch (err) {
         // On error, queue the message for retry instead of showing error
-        const queuedId = queueMessage({ text: displayMsg, agent: activeEmployee });
-        setMessages(prev => prev.map(m => m.id === assistantMsgId ? {
+        const queuedId = queueMessage({ text: displayMsg, agent: targetAgent });
+        updateAgentThread(targetAgent, targetThreadId, prev => prev.map(m => m.id === assistantMsgId ? {
           ...m,
           content: `[Connection lost — message queued. Will retry when Hermes reconnects.]`,
         } : m));
         setQueuedCount(q => q + 1);
         pulseMascot('error', 1800);
       } finally {
+        setPendingByAgent(prev => ({ ...prev, [targetAgent]: Math.max(0, (prev[targetAgent] || 1) - 1) }));
         setAgentThinking(false);
       }
     } else {
@@ -3536,7 +3868,7 @@ export default function App() {
           setAgentState('typing');
           const codeEvent = { type: 'tool', tool: 'code_exec', input: 'print("executing...")', output: 'Execution complete' };
           setToolEventsByMsg(prev => ({ ...prev, [demoMsgId]: [...(prev[demoMsgId] || []), codeEvent] }));
-          setMessages(prev => [...prev, { id: demoMsgId, role: 'assistant', employee: activeEmployee, content: `Protocol initiated by ${activeEmployee}. Analyzing parameters for "${inputValue}". local server hooks validated.` }]);
+          updateAgentThread(targetAgent, targetThreadId, prev => [...prev, { id: demoMsgId, role: 'assistant', employee: targetAgent, content: `Protocol initiated by ${targetAgent}. Analyzing parameters for "${inputValue}". local server hooks validated.` }]);
       }, 2000);
       setTimeout(() => setAgentState(inputValue.toLowerCase().includes('lobster') ? 'lobster' : 'job-done'), 4000);
       setTimeout(() => setAgentState('default'), 5500);
@@ -3574,6 +3906,34 @@ export default function App() {
       <ParticleFieldCanvas />
       <OfflineStatusBar />
       <ShareHandler onShared={handleShared} />
+
+      <div className="fixed top-4 right-4 z-[120] flex flex-col gap-2 pointer-events-none">
+        <AnimatePresence>
+          {notificationToasts.map((toast) => (
+            <motion.div
+              key={toast.id}
+              initial={{ opacity: 0, x: 18, scale: 0.98 }}
+              animate={{ opacity: 1, x: 0, scale: 1 }}
+              exit={{ opacity: 0, x: 12, scale: 0.98 }}
+              className="pointer-events-auto min-w-[220px] max-w-[300px] border-[2px] border-[#3a3a3e] bg-[#1c1c1e]/95 backdrop-blur-sm shadow-[4px_4px_0_0_#111] p-2"
+            >
+              <div className="flex items-start gap-2">
+                <div className="mt-0.5 w-2 h-2 rounded-full bg-[#22c55e] animate-pulse" />
+                <div className="flex-1 min-w-0">
+                  <p className="font-mono text-[8px] font-black uppercase text-[#22c55e]">{toast.agent || 'agent'}</p>
+                  <p className="font-mono text-[8px] text-[#e8e8ec]/80 truncate">{toast.text || 'New update'}</p>
+                </div>
+                <button
+                  onClick={() => setNotificationToasts(prev => prev.filter(t => t.id !== toast.id))}
+                  className="text-[#888] hover:text-[#e8e8ec] transition-colors"
+                >
+                  <X size={11} />
+                </button>
+              </div>
+            </motion.div>
+          ))}
+        </AnimatePresence>
+      </div>
 
       <AnimatePresence>
         {loadPhase === 'logo' && (
@@ -3632,26 +3992,27 @@ export default function App() {
                 <div className="space-y-1">
                   <div className="grid grid-cols-3 gap-1 bg-[#2a2a2e]/60 backdrop-blur-md border border-[#3a3a3e] p-1">
                   <button
+                    onClick={() => setViewMode('agents')}
+                    className={`flex items-center justify-center gap-1 p-2 rounded-lg transition-all ${viewMode === 'agents' ? 'bg-[#22c55e]/20 text-[#22c55e] border border-[#22c55e]/40 shadow-[0_0_12px_rgba(34,197,94,0.15)]' : 'text-[#e8e8ec]/40 hover:text-[#e8e8ec]/70'}`}
+                  >
+                    <Bot size={16} strokeWidth={3} />
+                    <span className="hidden lg:block font-sans font-black uppercase text-[9px] tracking-tight">Agents</span>
+                  </button>
+
+                  <button
                     onClick={() => setViewMode('session')}
                     className={`flex items-center justify-center gap-1 p-2 rounded-lg transition-all ${viewMode === 'session' ? 'bg-[#22c55e]/20 text-[#22c55e] border border-[#22c55e]/40 shadow-[0_0_12px_rgba(34,197,94,0.15)]' : 'text-[#e8e8ec]/40 hover:text-[#e8e8ec]/70'}`}
                   >
                     <Activity size={16} strokeWidth={3} />
                     <span className="hidden lg:block font-sans font-black uppercase text-[9px] tracking-tight">Session</span>
                   </button>
-                  
+
                   <button
                     onClick={() => setViewMode('projects')}
                     className={`flex items-center justify-center gap-1 p-2 rounded-lg transition-all ${viewMode === 'projects' ? 'bg-[#22c55e]/20 text-[#22c55e] border border-[#22c55e]/40 shadow-[0_0_12px_rgba(34,197,94,0.15)]' : 'text-[#e8e8ec]/40 hover:text-[#e8e8ec]/70'}`}
                   >
                     <Folder size={16} strokeWidth={3} />
                     <span className="hidden lg:block font-sans font-black uppercase text-[9px] tracking-tight">Projects</span>
-                  </button>
-                  <button
-                    onClick={() => setViewMode('agents')}
-                    className={`flex items-center justify-center gap-1 p-2 rounded-lg transition-all ${viewMode === 'agents' ? 'bg-[#22c55e]/20 text-[#22c55e] border border-[#22c55e]/40 shadow-[0_0_12px_rgba(34,197,94,0.15)]' : 'text-[#e8e8ec]/40 hover:text-[#e8e8ec]/70'}`}
-                  >
-                    <Bot size={16} strokeWidth={3} />
-                    <span className="hidden lg:block font-sans font-black uppercase text-[9px] tracking-tight">Agents</span>
                   </button>
                 </div>
                 </div>
@@ -3705,16 +4066,69 @@ export default function App() {
                       <p className="hidden lg:block font-mono text-[8px] font-black uppercase text-[#555] mb-2 px-2">Agent_Council</p>
                       {employees.map(emp => {
                         const isActive = emp.id === activeEmployee;
-                        const isWorking = isActive && agentState !== 'default' && agentState !== 'job-done';
+                        const isWorking = (pendingByAgent[emp.id] || 0) > 0;
+                        const unread = unreadByAgent[emp.id] || 0;
+                        const sessions = threadListByAgent[emp.id] || [];
+                        const recentSessions = sessions.slice(0, 5);
+                        const activeThreadForEmp = activeThreadIds[emp.id] || sessions[0]?.id || null;
+
                         return (
-                          <div key={emp.id} onClick={() => setActiveEmployee(emp.id)} className={`flex items-center gap-3 p-2 lg:p-3 border-[3px] cursor-pointer transition-all ${isActive ? 'bg-[#22c55e] border-[#111] shadow-[4px_4px_0_0_rgba(0,0,0,1)]' : 'border-transparent hover:border-[#111] hover:bg-black/5'}`}>
-                            <div className="relative">
-                              <span className={isActive ? 'text-[#111]' : 'text-[#111] opacity-50'}>{React.createElement(emp.icon, { size: 18 })}</span>
-                              {/* Status indicator dot */}
-                              <div className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border border-[#111] ${isWorking ? 'bg-[#22c55e] animate-pulse shadow-[0_0_6px_#22c55e]' : isActive ? 'bg-[#22c55e]' : 'bg-[#aaa]'}`} />
-                            </div>
-                            <div className="hidden lg:block flex-1"><p className="font-sans font-black uppercase text-[10px] mb-0.5">{emp.id}</p><p className="font-mono text-[7px] uppercase opacity-60">{emp.role}</p></div>
-                            {isWorking && <div className="hidden lg:flex gap-0.5 items-center"><div className="w-1 h-1 bg-[#111] rounded-full animate-bounce [animation-delay:-0.2s]" /><div className="w-1 h-1 bg-[#111] rounded-full animate-bounce [animation-delay:-0.1s]" /><div className="w-1 h-1 bg-[#111] rounded-full animate-bounce" /></div>}
+                          <div key={emp.id} className="space-y-1">
+                            <button
+                              onClick={() => setActiveEmployee(emp.id)}
+                              className={`w-full flex items-center gap-3 p-2 lg:p-3 border-[3px] cursor-pointer transition-all ${isActive ? 'bg-[#22c55e] border-[#111] shadow-[4px_4px_0_0_rgba(0,0,0,1)]' : 'border-transparent hover:border-[#111] hover:bg-black/5'}`}
+                            >
+                              <div className="relative">
+                                <span className={isActive ? 'text-[#111]' : 'text-[#111] opacity-50'}>{React.createElement(emp.icon, { size: 18 })}</span>
+                                <div className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border border-[#111] ${isWorking ? 'bg-[#22c55e] animate-pulse shadow-[0_0_6px_#22c55e]' : isActive ? 'bg-[#22c55e]' : 'bg-[#aaa]'}`} />
+                              </div>
+
+                              <div className="hidden lg:block flex-1 text-left">
+                                <p className="font-sans font-black uppercase text-[10px] mb-0.5">{emp.id}</p>
+                                <p className="font-mono text-[7px] uppercase opacity-60">{emp.role}</p>
+                              </div>
+
+                              <div className="hidden lg:flex items-center gap-1">
+                                {unread > 0 && (
+                                  <span className="px-1.5 py-0.5 border border-[#111] bg-[#111] text-[#22c55e] font-mono text-[7px] font-black rounded-sm">{unread}</span>
+                                )}
+                                {isWorking && <div className="flex gap-0.5 items-center"><div className="w-1 h-1 bg-[#111] rounded-full animate-bounce [animation-delay:-0.2s]" /><div className="w-1 h-1 bg-[#111] rounded-full animate-bounce [animation-delay:-0.1s]" /><div className="w-1 h-1 bg-[#111] rounded-full animate-bounce" /></div>}
+                                <ChevronRight size={12} className={`transition-transform ${isActive ? 'rotate-90 text-[#111]' : 'text-[#111] opacity-50'}`} />
+                              </div>
+                            </button>
+
+                            <AnimatePresence initial={false}>
+                              {isActive && (
+                                <motion.div
+                                  initial={{ opacity: 0, height: 0, y: -4 }}
+                                  animate={{ opacity: 1, height: 'auto', y: 0 }}
+                                  exit={{ opacity: 0, height: 0, y: -4 }}
+                                  className="ml-4 lg:ml-6 mr-1 border-[2px] border-[#3a3a3e] bg-[#1c1c1e]/60 backdrop-blur-sm overflow-hidden"
+                                >
+                                  <div className="px-2 py-1 border-b border-[#3a3a3e] flex items-center justify-between">
+                                    <p className="font-mono text-[7px] font-black uppercase text-[#888]">{emp.id}_Sessions</p>
+                                    <span className="font-mono text-[7px] text-[#22c55e]">{sessions.length}</span>
+                                  </div>
+                                    <div className="space-y-0">
+                                      {recentSessions.length === 0 && (
+                                        <p className="px-2 py-2 font-mono text-[7px] text-[#888]">No sessions yet for {emp.id}</p>
+                                      )}
+                                      {recentSessions.map((s, idx) => (
+                                        <button key={s.id || `${emp.id}-session-item-${idx}`} onClick={() => { setActiveEmployee(emp.id); setActiveThreadId(emp.id, s.id); }} className={`w-full text-left px-2 py-1.5 border-b border-[#2f2f33] last:border-b-0 ${activeThreadForEmp === s.id ? 'bg-[#111]/40' : 'hover:bg-[#111]/20'}`}>
+                                          <div className="flex items-center justify-between gap-2 mb-0.5">
+                                            <span className="font-mono text-[7px] font-black uppercase text-[#22c55e]">Thread {idx + 1}</span>
+                                            <span className="font-mono text-[7px] text-[#888]">{s.updated_at ? formatRelativeTime(new Date(s.updated_at).getTime()) : 'saved'}</span>
+                                          </div>
+                                          <p className="font-mono text-[7px] text-[#e8e8ec]/75 truncate">{s.title || 'New session'}</p>
+                                          {s.preview ? (
+                                            <p className="font-mono text-[7px] text-[#aaa] leading-relaxed line-clamp-2 mt-0.5">{s.preview}</p>
+                                          ) : null}
+                                        </button>
+                                      ))}
+                                    </div>
+</motion.div>
+                              )}
+                            </AnimatePresence>
                           </div>
                         );
                       })}
@@ -4022,46 +4436,56 @@ export default function App() {
                         {msg.employee}_V4
                       </div>
                     )}
-                    {/* Tool call cards — shown for assistant messages that have tool events */}
-                    {msg.role === 'assistant' && toolEventsByMsg[msg.id]?.map((tool, idx) => {
-                      const key = `${msg.id}-${idx}`;
-                      const isOpen = expandedTools[key] || false;
-                      const toolIcon = tool.tool === 'websearch' || tool.tool === 'search' ? <Search size={11} /> : tool.tool === 'code_exec' || tool.tool === 'code' ? <Terminal size={11} /> : <Zap size={11} />;
-                      return (
-                        <div key={key} className="mt-2 w-full max-w-[95%] lg:max-w-[80%]">
-                          <button
-                            onClick={() => setExpandedTools(prev => ({ ...prev, [key]: !prev[key] }))}
-                            className="w-full flex items-center gap-2 px-3 py-2 bg-[#1c1c1e]/95 backdrop-blur-sm border-[2px] border-[#3a3a3e] shadow-[3px_3px_0_0_#3a3a3e] text-left hover:shadow-[3px_3px_0_0_#22c55e] transition-all"
+                    {/* Tool events as a collapsible assistant subthread */}
+                    {msg.role === 'assistant' && Array.isArray(toolEventsByMsg[msg.id]) && toolEventsByMsg[msg.id].length > 0 && (
+                      <div className="mt-2 w-full max-w-[95%] lg:max-w-[80%]">
+                        <button
+                          onClick={() => setExpandedTools(prev => ({ ...prev, [msg.id]: !prev[msg.id] }))}
+                          className="w-full flex items-center gap-2 px-3 py-2 bg-[#1c1c1e]/95 backdrop-blur-sm border-[2px] border-[#3a3a3e] shadow-[3px_3px_0_0_#3a3a3e] text-left hover:shadow-[3px_3px_0_0_#22c55e] transition-all"
+                        >
+                          <span className="text-[#22c55e]"><List size={11} /></span>
+                          <span className="font-mono text-[9px] font-black uppercase text-[#22c55e] tracking-widest">SHOW STEPS ({toolEventsByMsg[msg.id].length})</span>
+                          <span className="font-mono text-[8px] uppercase text-[#888] ml-auto">{expandedTools[msg.id] ? '▲ HIDE' : '▼ OPEN'}</span>
+                        </button>
+                        {expandedTools[msg.id] && (
+                          <motion.div
+                            initial={{ opacity: 0, height: 0 }}
+                            animate={{ opacity: 1, height: 'auto' }}
+                            className="overflow-hidden bg-[#2a2a2e]/90 backdrop-blur-sm border-[2px] border-t-0 border-[#3a3a3e] shadow-[3px_3px_0_0_#3a3a3e]"
                           >
-                            <span className="text-[#22c55e]">{toolIcon}</span>
-                            <span className="font-mono text-[9px] font-black uppercase text-[#22c55e] tracking-widest">TOOL: {tool.tool}</span>
-                            <span className="font-mono text-[8px] uppercase text-[#888] ml-auto">{isOpen ? '▲ COLLAPSE' : '▼ EXPAND'}</span>
-                          </button>
-                          {isOpen && (
-                            <motion.div
-                              initial={{ opacity: 0, height: 0 }}
-                              animate={{ opacity: 1, height: 'auto' }}
-                              className="overflow-hidden bg-[#2a2a2e]/90 backdrop-blur-sm border-[2px] border-t-0 border-[#3a3a3e] shadow-[3px_3px_0_0_#3a3a3e]"
-                            >
-                              <div className="p-3 space-y-2">
-                                {tool.input && (
-                                  <div>
-                                    <p className="font-mono text-[7px] font-black uppercase text-[#888] mb-1">INPUT</p>
-                                    <pre className="font-mono text-[9px] text-[#e8e8ec] whitespace-pre-wrap break-all bg-[#1c1c1e] p-2 border-[2px] border-[#3a3a3e]">{typeof tool.input === 'string' ? tool.input : JSON.stringify(tool.input, null, 2)}</pre>
+                            <div className="p-3 space-y-2">
+                              {toolEventsByMsg[msg.id].map((tool, idx) => {
+                                const toolIcon = tool.tool === 'websearch' || tool.tool === 'search'
+                                  ? <Search size={11} />
+                                  : tool.tool === 'code_exec' || tool.tool === 'code'
+                                    ? <Terminal size={11} />
+                                    : <Zap size={11} />;
+                                return (
+                                  <div key={`${msg.id}-step-${idx}`} className="border-[1px] border-[#3a3a3e] bg-[#1c1c1e]/70 p-2">
+                                    <div className="flex items-center gap-2 mb-1">
+                                      <span className="text-[#22c55e]">{toolIcon}</span>
+                                      <p className="font-mono text-[8px] font-black uppercase text-[#22c55e]">Step {idx + 1}: {tool.tool || tool.name || 'tool'}</p>
+                                    </div>
+                                    {tool.input && (
+                                      <div className="mb-1">
+                                        <p className="font-mono text-[7px] font-black uppercase text-[#888] mb-1">INPUT</p>
+                                        <pre className="font-mono text-[9px] text-[#e8e8ec] whitespace-pre-wrap break-all bg-[#1c1c1e] p-2 border-[1px] border-[#3a3a3e]">{typeof tool.input === 'string' ? tool.input : JSON.stringify(tool.input, null, 2)}</pre>
+                                      </div>
+                                    )}
+                                    {tool.output && (
+                                      <div>
+                                        <p className="font-mono text-[7px] font-black uppercase text-[#888] mb-1">OUTPUT</p>
+                                        <pre className="font-mono text-[9px] text-[#e8e8ec] whitespace-pre-wrap break-all bg-[#1c1c1e] p-2 border-[1px] border-[#3a3a3e]">{typeof tool.output === 'string' ? tool.output : JSON.stringify(tool.output, null, 2)}</pre>
+                                      </div>
+                                    )}
                                   </div>
-                                )}
-                                {tool.output && (
-                                  <div>
-                                    <p className="font-mono text-[7px] font-black uppercase text-[#888] mb-1">OUTPUT</p>
-                                    <pre className="font-mono text-[9px] text-[#e8e8ec] whitespace-pre-wrap break-all bg-[#1c1c1e] p-2 border-[2px] border-[#3a3a3e]">{typeof tool.output === 'string' ? tool.output : JSON.stringify(tool.output, null, 2)}</pre>
-                                  </div>
-                                )}
-                              </div>
-                            </motion.div>
-                          )}
-                        </div>
-                      );
-                    })}
+                                );
+                              })}
+                            </div>
+                          </motion.div>
+                        )}
+                      </div>
+                    )}
                   </motion.div>
                 ))}
               </AnimatePresence>
