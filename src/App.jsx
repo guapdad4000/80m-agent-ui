@@ -212,12 +212,8 @@ const WaveformIndicator = ({ agentState, isRecording, agentThinking }) => {
 // =====================================================================
 // DEFAULT AGENT CONFIG — user-configurable via Settings
 // =====================================================================
-const HERMES_BASE = getHermesBase();
-const LOCAL_API_BASE = getLocalApiBase();
-const WEBHOOK_BASE = getWebhookBase();
-const HERMES_HTTP = HERMES_BASE;
 const DEFAULT_CONFIG = {
-  apiEndpoint: `${HERMES_BASE}/chat`,
+  apiEndpoint: `${getHermesBase()}/chat`,
   apiEnabled: true,
   agents: [
     { id: 'prawnius', icon: 'Bot', role: 'Quick Tasks', color: '#22c55e' },
@@ -595,7 +591,24 @@ const SettingsPanel = ({ config, onSave, onClose }) => {
   };
 
   const handleSaveEndpoints = () => {
-    setEndpointConfig(endpointConfig);
+    const previousHermesBase = getHermesBase();
+    const nextEndpoints = setEndpointConfig(endpointConfig);
+
+    setLocalConfig(prev => {
+      const previousHermesChat = `${previousHermesBase}/chat`;
+      const nextHermesChat = `${nextEndpoints.hermesBase}/chat`;
+      const shouldPinToHermes =
+        !prev.apiEndpoint ||
+        prev.apiEndpoint === previousHermesChat ||
+        prev.provider === 'hermes';
+
+      if (!shouldPinToHermes) return prev;
+      return {
+        ...prev,
+        apiEndpoint: nextHermesChat,
+      };
+    });
+
     setEndpointStatus('saved');
     setTimeout(() => setEndpointStatus(''), 2500);
   };
@@ -787,7 +800,7 @@ const SettingsPanel = ({ config, onSave, onClose }) => {
                   type="text"
                   value={localConfig.apiEndpoint}
                   onChange={e => setLocalConfig(p => ({ ...p, apiEndpoint: e.target.value }))}
-                  placeholder={`${HERMES_BASE}/chat`}
+                  placeholder={`${getHermesBase()}/chat`}
                   className="flex-1 bg-white border-[3px] border-[#111] px-3 py-2 font-mono text-xs focus:outline-none focus:shadow-[4px_4px_0_0_#111]"
                 />
                 <button
@@ -902,7 +915,7 @@ const SettingsPanel = ({ config, onSave, onClose }) => {
                   ))}
                 </div>
               )}
-              <p className="font-mono text-[7px] text-[#777]">Reload app after saving so all modules use new endpoint values.</p>
+              <p className="font-mono text-[7px] text-[#777]">Saved endpoints are applied immediately (including Hermes connectivity checks).</p>
             </div>
 
             <div className="flex items-center justify-between p-3 border-[3px] border-[#111] bg-white">
@@ -1076,7 +1089,7 @@ const SettingsPanel = ({ config, onSave, onClose }) => {
                   type="text"
                   value={localConfig.apiEndpoint}
                   onChange={e => setLocalConfig(p => ({ ...p, apiEndpoint: e.target.value }))}
-                  placeholder={`${HERMES_BASE}/chat`}
+                  placeholder={`${getHermesBase()}/chat`}
                   className="flex-1 bg-white border-[3px] border-[#111] px-3 py-2 font-mono text-xs focus:outline-none focus:shadow-[4px_4px_0_0_#111]"
                 />
                 <button
@@ -1285,7 +1298,7 @@ const MemoryBrowserPanel = ({ onClose }) => {
     setLoading(true);
     setError('');
     try {
-      const res = await fetch(`${HERMES_BASE}/chat`, {
+      const res = await fetch(`${getHermesBase()}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1315,7 +1328,7 @@ const MemoryBrowserPanel = ({ onClose }) => {
     setError('');
     setActiveTab('recent');
     try {
-      const res = await fetch(`${HERMES_BASE}/chat`, {
+      const res = await fetch(`${getHermesBase()}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1449,10 +1462,10 @@ const JobsPipelinePanel = ({ onClose }) => {
     setError('');
     try {
       // Try Hermes jobs endpoint
-      let res = await fetch(`${HERMES_BASE}/jobs`, { signal: AbortSignal.timeout(5000) });
+      let res = await fetch(`${getHermesBase()}/jobs`, { signal: AbortSignal.timeout(5000) });
       if (!res.ok) {
         // Fallback: try /sessions as jobs proxy (shows recent sessions)
-        res = await fetch(`${HERMES_BASE}/sessions`, { signal: AbortSignal.timeout(5000) });
+        res = await fetch(`${getHermesBase()}/sessions`, { signal: AbortSignal.timeout(5000) });
       }
       if (res.ok) {
         let data = await res.json();
@@ -1627,7 +1640,7 @@ const MCPSettingsPanel = ({ onClose }) => {
   const testConnection = async (serverName) => {
     setTestResults(prev => ({ ...prev, [serverName]: 'testing' }));
     try {
-      const res = await fetch(`${HERMES_BASE}/mcp/test`, {
+      const res = await fetch(`${getHermesBase()}/mcp/test`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ server: serverName }),
@@ -1896,7 +1909,7 @@ const SkillsHubPanel = ({ onClose }) => {
     setError('');
     try {
       // Fetch skills from local FS API
-      const res = await fetch(`${LOCAL_API_BASE}/skills`, { signal: AbortSignal.timeout(5000) });
+      const res = await fetch(`${getLocalApiBase()}/skills`, { signal: AbortSignal.timeout(5000) });
       if (!res.ok) {
         // Skills endpoint not available — show empty state
         setSkills([]);
@@ -2379,7 +2392,7 @@ const PreviewPanel = ({ content, filePath, onClose }) => {
         .then(t => { setFileContent(t); setLoading(false); })
         .catch(() => {
           // Fallback: try the local file server
-          fetch(`${LOCAL_API_BASE}/fs/read?path=${encodeURIComponent(filePath)}`)
+          fetch(`${getLocalApiBase()}/fs/read?path=${encodeURIComponent(filePath)}`)
             .then(r2 => { if (!r2.ok) throw new Error(`HTTP ${r2.status}`); return r2.text(); })
             .then(t2 => { setFileContent(t2); setLoading(false); })
             .catch(e2 => { setError(`Could not read file. Path: ${filePath}`); setLoading(false); });
@@ -2409,9 +2422,9 @@ const PreviewPanel = ({ content, filePath, onClose }) => {
       try {
         const candidates = [
           `/fs/raw?path=${encodeURIComponent(filePath)}`,
-          `${LOCAL_API_BASE}/fs/raw?path=${encodeURIComponent(filePath)}`,
+          `${getLocalApiBase()}/fs/raw?path=${encodeURIComponent(filePath)}`,
           `/fs/read?path=${encodeURIComponent(filePath)}`,
-          `${LOCAL_API_BASE}/fs/read?path=${encodeURIComponent(filePath)}`,
+          `${getLocalApiBase()}/fs/read?path=${encodeURIComponent(filePath)}`,
         ];
         for (const url of candidates) {
           try {
@@ -2441,7 +2454,7 @@ const PreviewPanel = ({ content, filePath, onClose }) => {
   const previewSource = pdfBlobUrl || (filePath
     ? (filePath.startsWith('http://') || filePath.startsWith('https://')
       ? filePath
-      : `${LOCAL_API_BASE}/fs/read?path=${encodeURIComponent(filePath)}`)
+      : `${getLocalApiBase()}/fs/read?path=${encodeURIComponent(filePath)}`)
     : '');
 
   return (
@@ -2550,7 +2563,7 @@ const FileTree = ({ rootPath, onFileSelect, selectedFile, onRefresh }) => {
     setLoading(true);
     try {
       // File browsing via local FS API at port 5180
-      let res = await fetch(`${LOCAL_API_BASE}/fs/list?path=${encodeURIComponent(path)}`);
+      let res = await fetch(`${getLocalApiBase()}/fs/list?path=${encodeURIComponent(path)}`);
       if (res.ok) {
         const data = await res.json();
         return data.files || [];
@@ -3254,7 +3267,7 @@ export default function App() {
   }, [unreadByAgent]);
 
   const fetchThreadsForAgent = useCallback(async (agentId) => {
-    const res = await fetch(`${HERMES_BASE}/threads?agent_id=${encodeURIComponent(agentId)}`, {
+    const res = await fetch(`${getHermesBase()}/threads?agent_id=${encodeURIComponent(agentId)}`, {
       signal: AbortSignal.timeout(8000),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -3268,7 +3281,7 @@ export default function App() {
   }, [setActiveThreadId]);
 
   const createConversation = useCallback(async (agentId = activeEmployeeRef.current) => {
-    const res = await fetch(`${HERMES_BASE}/threads`, {
+    const res = await fetch(`${getHermesBase()}/threads`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ agent_id: agentId, title: 'New conversation' }),
@@ -3315,7 +3328,7 @@ export default function App() {
       const key = makeThreadStorageKey(activeEmployee, threadId);
       const existingThread = agentThreadsRef.current[key] || [];
       if (existingThread.length > 0) return;
-      const res = await fetch(`${HERMES_BASE}/agent-context/${encodeURIComponent(activeEmployee)}?thread_id=${encodeURIComponent(threadId)}&limit=120`, {
+      const res = await fetch(`${getHermesBase()}/agent-context/${encodeURIComponent(activeEmployee)}?thread_id=${encodeURIComponent(threadId)}&limit=120`, {
         signal: AbortSignal.timeout(8000),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -3641,11 +3654,11 @@ export default function App() {
         if (!ok) throw new Error('Hermes unreachable');
       }),
       check('Hermes /health', async () => {
-        const res = await fetch(`${HERMES_BASE}/health`, { signal: AbortSignal.timeout(5000) });
+        const res = await fetch(`${getHermesBase()}/health`, { signal: AbortSignal.timeout(5000) });
         if (!res.ok) throw new Error(`Status ${res.status}`);
       }),
       check('Webhook Service /webhooks', async () => {
-        const res = await fetch(`${WEBHOOK_BASE}/webhooks`, { signal: AbortSignal.timeout(5000) });
+        const res = await fetch(`${getWebhookBase()}/webhooks`, { signal: AbortSignal.timeout(5000) });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
       }),
     ]);
@@ -3779,7 +3792,7 @@ export default function App() {
         if (jobId) {
           pulseMascot('searching', 1200);
           let completed = false;
-          const streamed = await tryStreamJobViaSSE({ baseUrl: HERMES_BASE, jobId });
+          const streamed = await tryStreamJobViaSSE({ baseUrl: getHermesBase(), jobId });
           if (streamed?.thread_id) setActiveThreadId(targetAgent, streamed.thread_id);
           if (streamed?.sessionId) setAgentSessionId(targetAgent, streamed.sessionId, streamed.thread_id || targetThreadId);
           if (streamed?.completed) {
@@ -3792,7 +3805,7 @@ export default function App() {
           if (!completed) {
             for (let i = 0; i < 300; i++) {
               await new Promise(r => setTimeout(r, 1000));
-              const statusRes = await fetch(`${HERMES_BASE}/chat/status/${jobId}`, {
+              const statusRes = await fetch(`${getHermesBase()}/chat/status/${jobId}`, {
                 signal: AbortSignal.timeout(10000),
               });
               if (!statusRes.ok) continue;

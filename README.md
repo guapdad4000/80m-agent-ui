@@ -22,6 +22,12 @@ npm run build
 npm run preview
 ```
 
+Run a full local smoke check (lint + production build):
+
+```bash
+npm run smoke
+```
+
 ---
 
 ## PWA Install (Native App)
@@ -47,6 +53,7 @@ Click the **Settings** button (top-right gear) to configure:
 - **API Endpoint**: Your agent's chat API (e.g. `http://localhost:5174/chat`)
 - Leave empty or disable API to run in **Demo Mode** (simulated responses)
 - **Welcome Message**: Customise the opening greeting
+- If you save a new **Hermes base URL**, the app now auto-updates chat routing/connectivity checks immediately (no reload required)
 
 ### Agents Tab
 - Add/remove/reorder agents in the council

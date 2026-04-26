@@ -3,7 +3,6 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { getQueue } from '../offlineQueue';
 import { getHermesBase } from '../config/endpoints';
 
-const HERMES_BASE = getHermesBase();
 const PING_INTERVAL_MS = 10000; // ping Hermes every 10s
 
 export default function useOffline() {
@@ -29,12 +28,13 @@ export default function useOffline() {
 
   // Ping Hermes to check connectivity — use /sessions which always returns 200
   const pingHermes = useCallback(async () => {
+    const hermesBase = getHermesBase();
     if (!navigator.onLine) {
       setIsHermesConnected(false);
       return;
     }
     try {
-      const res = await fetch(`${HERMES_BASE}/sessions`, {
+      const res = await fetch(`${hermesBase}/sessions`, {
         signal: AbortSignal.timeout(4000),
       });
       setIsHermesConnected(res.ok);
