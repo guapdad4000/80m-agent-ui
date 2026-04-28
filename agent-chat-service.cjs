@@ -402,13 +402,16 @@ function buildTranscriptRecallResponse(agentId, threadId, message) {
   return userMessages.map(msg => msg.content).join('\n\n');
 }
 
+// Escape [ and ] so Rich doesn't interpret them as markup tags in Hermes output.
+const escapeRich = s => String(s).replace(/\[/g, '\\[').replace(/\]/g, '\\]');
+
 function buildHermesUserMessage(agentId, threadId, userMessage) {
   const recent = getRecentMessages(agentId, threadId, 8).slice(0, -1);
   if (!recent.length) return userMessage;
   const transcript = recent
     .map(msg => `${msg.role.toUpperCase()}: ${msg.content}`)
     .join('\n');
-  return `[APP THREAD CONTEXT]\nUse this recent thread context if the user asks about previous messages. Do not claim memory loss if the answer is in this transcript.\n${transcript}\n[/APP THREAD CONTEXT]\n\nCURRENT USER MESSAGE:\n${userMessage}`;
+  return `\\[APP THREAD CONTEXT\\]\nUse this recent thread context if the user asks about previous messages. Do not claim memory loss if the answer is in this transcript.\n${transcript}\n\\[/APP THREAD CONTEXT\\]\n\nCURRENT USER MESSAGE:\n${userMessage}`;
 }
 
 function parseHermesLine(raw) {
@@ -455,34 +458,83 @@ function parseHermesLine(raw) {
 
 function parseResponse(stdout) {
   const lines = stdout.split('\n');
+
+  // ── Strategy 1: Box-based extraction (primary) ──────────────────────────────
   const SKIP = [
     /^⚠️.*API call failed/, /^⏱️.*Elapsed:/, /^🗜️/, /^📋/, /^🔌/, /^🌐/,
     /^Query:/, /^Initializing agent/, /^\s*\[/, /^Go for it\.+/,
-    /^I'm (right )?here/, /^\|\s+\|.*Context:/
+    /^I'm (right )?here/, /^\|\s+\|.*Context:/,
+    /^\s*─+\s*$/,  // skip separator lines of dashes
   ];
   const isNoise = t => SKIP.some(p => p.test(t));
   const isFooter = t => /^(Session|Duration|Messages):\s+\S/.test(t) || t.startsWith('Resume this session') || t.startsWith('hermes --resume');
-  const isBoxOpener = t => t.includes('⚕ Hermes');
+  // Hermes box opener: the ⚕ symbol appears somewhere in the line (skin engine may change label)
+  const isBoxOpener = t => t.includes('⚕');
   let responseStarted = false;
   let responseEnded = false;
   const responseLines = [];
   for (const raw of lines) {
     const trimmed = raw.trim();
-    if (isFooter(trimmed)) { if (responseStarted) responseEnded = true; continue; }
-    if (/^Go for it/.test(trimmed)) { responseLines.length = 0; responseStarted = false; responseEnded = false; continue; }
-    if (!responseStarted && isBoxOpener(trimmed)) { responseStarted = true; continue; }
-    if (!responseStarted || responseEnded || !trimmed || isNoise(trimmed)) continue;
-    const boxChars = (trimmed.match(/[─│┌┐└┘├┤┬┴┼]/g) || []).length;
-    if (boxChars > trimmed.length * 0.5) continue;
+    if (!trimmed) continue;
+    const display = trimmed.replace(/\x1b\[[0-9;]*m/g, '');
+    if (isFooter(display)) { if (responseStarted) responseEnded = true; continue; }
+    if (/^Go for it/.test(display)) { responseLines.length = 0; responseStarted = false; responseEnded = false; continue; }
+    if (!responseStarted && isBoxOpener(display)) { responseStarted = true; continue; }
+    if (!responseStarted || responseEnded || isNoise(display)) continue;
+    // Skip pure box-char / separator lines
+    const nonSpace = display.replace(/\s/g, '');
+    const boxChars = (nonSpace.match(/[─│┌┐└┘├┤┬┴┼]/g) || []).length;
+    if (boxChars > 0 && boxChars >= nonSpace.length * 0.6) continue;
     responseLines.push(trimmed);
   }
-  return responseLines.join(' ').trim() || 'No response extracted';
+
+  // If box method got text, return it
+  if (responseLines.join('').trim()) return responseLines.join(' ').trim();
+
+  // ── Strategy 2: Extract everything between Query: and Session: ──────────────
+  let inQuery = false;
+  const queryLines = [];
+  for (const raw of lines) {
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    const display = trimmed.replace(/\x1b\[[0-9;]*m/g, '');
+    if (/^Query:/.test(display)) { inQuery = true; continue; }
+    if (/^Session:/.test(display) || /^Duration:/.test(display)) { inQuery = false; break; }
+    if (/^Resume this session/.test(display)) { inQuery = false; break; }
+    if (!inQuery) continue;
+    if (isNoise(display)) continue;
+    // Skip the " ─  ⚕ Hermes  ─..." separator line
+    const nonSpace = display.replace(/\s/g, '');
+    const boxChars = (nonSpace.match(/[─│┌┐└┘├┤┬┴┼]/g) || []).length;
+    if (boxChars > 0 && boxChars >= nonSpace.length * 0.5) continue;
+    queryLines.push(trimmed);
+  }
+  if (queryLines.join('').trim()) return queryLines.join(' ').trim();
+
+  // ── Strategy 3: Last resort — grab all non-noise text after Query: ─────────
+  const afterQuery = [];
+  let seenQuery = false;
+  for (const raw of lines) {
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    const display = trimmed.replace(/\x1b\[[0-9;]*m/g, '');
+    if (/^Query:/.test(display)) { seenQuery = true; continue; }
+    if (/^(Session|Duration):/.test(display) || /^Resume this/.test(display)) break;
+    if (!seenQuery) continue;
+    if (isNoise(display)) continue;
+    const nonSpace = display.replace(/\s/g, '');
+    const boxChars = (nonSpace.match(/[─│┌┐└┘├┤┬┴┼]/g) || []).length;
+    if (boxChars > 0 && boxChars >= nonSpace.length * 0.4) continue;
+    afterQuery.push(trimmed);
+  }
+  return afterQuery.join(' ').trim() || 'No response extracted';
 }
 
 function execHermesWithStream(jobId, args) {
   return new Promise((resolve, reject) => {
     const proc = spawn(HERMES_CLI, args, { cwd: HERMES_CWD, env: { ...process.env } });
     let stdout = '';
+    let stderr = '';
     const events = [];
     proc.stdout.on('data', d => {
       const chunk = d.toString();
@@ -498,11 +550,16 @@ function execHermesWithStream(jobId, args) {
     });
     proc.stderr.on('data', d => {
       const chunk = d.toString();
+      stderr += chunk;
       if (chunk.includes('Error') || chunk.includes('WARN')) {
         broadcastEvent(jobId, { type: 'stderr', text: chunk.trim().slice(0, 200) });
       }
     });
     proc.on('close', code => {
+      // Debug: write full stdout + stderr to files
+      fs.writeFileSync('/tmp/hermes_stdout.log', stdout);
+      fs.writeFileSync('/tmp/hermes_stderr.log', stderr);
+      fs.writeFileSync('/tmp/hermes_args.log', JSON.stringify(args));
       if (code !== 0 && !stdout.trim()) {
         reject(new Error(`Hermes exited ${code}`));
         return;

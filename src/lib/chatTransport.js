@@ -21,6 +21,10 @@ export const extractAssistantText = (data) => {
   if (typeof data.response === 'string') return data.response;
   if (typeof data.output === 'string') return data.output;
   if (typeof data.message === 'string') return data.message;
+  // Hermes wraps response in { result: { response: "..." } }
+  if (typeof data.result?.response === 'string') return data.result.response;
+  if (typeof data.result?.text === 'string') return data.result.text;
+  if (typeof data.result?.message === 'string') return data.result.message;
 
   const content = data.choices?.[0]?.message?.content;
   if (typeof content === 'string') return content;
