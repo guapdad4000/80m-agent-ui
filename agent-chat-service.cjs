@@ -402,16 +402,13 @@ function buildTranscriptRecallResponse(agentId, threadId, message) {
   return userMessages.map(msg => msg.content).join('\n\n');
 }
 
-// Escape [ and ] so Rich doesn't interpret them as markup tags in Hermes output.
-const escapeRich = s => String(s).replace(/\[/g, '\\[').replace(/\]/g, '\\]');
-
 function buildHermesUserMessage(agentId, threadId, userMessage) {
   const recent = getRecentMessages(agentId, threadId, 8).slice(0, -1);
   if (!recent.length) return userMessage;
   const transcript = recent
     .map(msg => `${msg.role.toUpperCase()}: ${msg.content}`)
     .join('\n');
-  return `\\[APP THREAD CONTEXT\\]\nUse this recent thread context if the user asks about previous messages. Do not claim memory loss if the answer is in this transcript.\n${transcript}\n\\[/APP THREAD CONTEXT\\]\n\nCURRENT USER MESSAGE:\n${userMessage}`;
+  return `[APP THREAD CONTEXT]\nUse this recent thread context if the user asks about previous messages. Do not claim memory loss if the answer is in this transcript.\n${transcript}\n[/APP THREAD CONTEXT]\n\nCURRENT USER MESSAGE:\n${userMessage}`;
 }
 
 function parseHermesLine(raw) {
@@ -556,10 +553,6 @@ function execHermesWithStream(jobId, args) {
       }
     });
     proc.on('close', code => {
-      // Debug: write full stdout + stderr to files
-      fs.writeFileSync('/tmp/hermes_stdout.log', stdout);
-      fs.writeFileSync('/tmp/hermes_stderr.log', stderr);
-      fs.writeFileSync('/tmp/hermes_args.log', JSON.stringify(args));
       if (code !== 0 && !stdout.trim()) {
         reject(new Error(`Hermes exited ${code}`));
         return;
