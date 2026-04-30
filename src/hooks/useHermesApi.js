@@ -4,8 +4,6 @@ import { queueMessage, processQueue } from '../offlineQueue';
 import { isOpenAICompatibleEndpoint, buildApiPayload, extractAssistantText } from '../lib/chatTransport';
 import { getHermesBase } from '../config/endpoints';
 
-const HERMES_BASE = getHermesBase();
-const HERMES_URL = HERMES_BASE;
 const POLL_INTERVAL_MS = 2000;
 
 export default function useHermesApi() {
@@ -13,8 +11,9 @@ export default function useHermesApi() {
 
   // Check connectivity — use /sessions which always returns 200
   const checkConnection = useCallback(async () => {
+    const hermesBase = getHermesBase();
     try {
-      const res = await fetch(`${HERMES_BASE}/sessions`, {
+      const res = await fetch(`${hermesBase}/sessions`, {
         signal: AbortSignal.timeout(4000),
       });
       setIsConnected(res.ok);
@@ -31,7 +30,7 @@ export default function useHermesApi() {
    * @returns {Promise<Object>} final statusData
    */
   const pollJobStatus = useCallback(async (jobId) => {
-    const base = HERMES_URL;
+    const base = getHermesBase();
     for (let i = 0; i < 300; i++) {
       await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
       try {
@@ -69,7 +68,8 @@ export default function useHermesApi() {
     }
 
     // Submit the job
-    const endpoint = isOpenAICompatibleEndpoint(HERMES_URL) ? HERMES_URL : `${HERMES_URL}/chat`;
+    const hermesBase = getHermesBase();
+    const endpoint = isOpenAICompatibleEndpoint(hermesBase) ? hermesBase : `${hermesBase}/chat`;
     const payload = buildApiPayload({ endpoint, message: text, agentId, provider }); // Added provider
 
     const res = await fetch(endpoint, {
@@ -103,7 +103,8 @@ export default function useHermesApi() {
    * @returns {Promise<Object>} JSON response
    */
   const fetchFsList = useCallback(async (path) => {
-    const res = await fetch(`${HERMES_URL}/fs/list?path=${encodeURIComponent(path)}`, {
+    const hermesBase = getHermesBase();
+    const res = await fetch(`${hermesBase}/fs/list?path=${encodeURIComponent(path)}`, {
       signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -116,7 +117,8 @@ export default function useHermesApi() {
    * @returns {Promise<string>} file content
    */
   const fetchFsRead = useCallback(async (path) => {
-    const res = await fetch(`${HERMES_URL}/fs/read?path=${encodeURIComponent(path)}`, {
+    const hermesBase = getHermesBase();
+    const res = await fetch(`${hermesBase}/fs/read?path=${encodeURIComponent(path)}`, {
       signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);

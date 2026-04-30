@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
+    "smoke": "npm run lint && npm run build",
     "preview": "vite preview",
     "generate-icons": "node scripts/generate-icons.js",
     "server": "node agent-chat-service.cjs"
